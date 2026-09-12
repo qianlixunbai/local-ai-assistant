@@ -1,10 +1,33 @@
 # Development Status
 
-## 版本状态（v0.2.0）
+## 版本状态（v0.2.1）
 
-**Result: GO** —— Browser Translator v0.2.0 已通过真实 Chrome 人工验收。
+**Result: GO** —— v0.2.1 为稳定性 hotfix（P1-1 / P1-2 / P2）。
+代码与自动化测试已通过（Race 33 / Dynamic 35 / Footer 34 / Viewport 26 / StateMachine 45，
+共 173 checks），并已通过真实 Chrome 人工验收。
 
-真实 Chrome 人工验收通过项：
+v0.2.1 真实 Chrome 人工验收（通过）：
+
+- **Dynamic Content 正常**：`Load More Jobs` 新增卡片自动增量翻译，无需再次点击
+- **Restore → immediate Translate race 正常**：恢复原文后立即重新点击翻译，
+  不残留旧会话译文、无重复节点、无 stale 结果写入
+- **extension reload 后 watcher re-arm 正常**：页面已翻译状态下 reload 扩展，
+  DOM 译文仍在、watcher 丢失；再次点击 Translate 恢复监听，不重译、不删旧译文
+- 初始页面翻译 / Restore / 动态新增内容 / 关闭 popup 不中断翻译 等既有行为回归正常
+
+v0.2.1 automated regression suite is reproducible from repository.
+测试脚本位于 `test/`，仅依赖 `jsdom`（devDependency）。新机器执行：
+
+```bash
+npm ci
+npm test
+```
+
+即可离线复现全部 173 checks（不依赖本机 Chrome / Ollama / 临时目录 / 绝对路径）。
+`package.json` 仅供开发 / 测试，浏览器扩展仍是原生 HTML/CSS/JS，无构建步骤、
+无运行时 npm 依赖。
+
+v0.2.0 已通过真实 Chrome 人工验收（历史记录）：
 
 - 初始页面翻译正常
 - `Load More Jobs` 新增内容可自动翻译（MutationObserver 动态翻译正常）
@@ -12,9 +35,51 @@
 - Restore 后停止动态翻译（watcher 已 disconnect）
 - 重新 Translate 后 watcher 可再次启动
 
-自动化测试（jsdom）同样通过（Dynamic 35 / Footer 34 / Viewport 26）。
+v0.2.1 相对 v0.2.0 的改动（不含新功能，仅稳定性）：
 
-## 当前实际配置（v0.2.0）
+- **P1-1 初始翻译窗口 catch-up**：首次整页翻译完成后，除了 `startWatching()`，
+  还会主动做一次动态 catch-up 扫描，补翻「首次翻译进行期间新增、但 observer
+  尚未启动」的 DOM，不再依赖后续 mutation 碰巧触发
+- **P1-2 会话 generation 隔离**：以 `sessionGeneration` 取代原先的全局
+  `cancelRequested` boolean。Restore / LAT_RESET / 每次新翻译都会递增 generation；
+  所有 async 翻译循环捕获自己的 generation，`await` 返回后若已换代则丢弃结果，
+  不插入 DOM、不改 `session` / `watching` / `progress`
+- **P2 重复点击幂等**：popup 在 `LAT_RESET` 之前先 `GET_STATUS`；
+  页面为 `watching` 时不再清空、不再请求模型；
+  `partial` 页面跳过 `LAT_RESET`，只补翻未翻译 record
+
+### P2 补充：partial 状态机（本轮 Reviewer 复核后修复）
+
+Reviewer 发现上一版 P2 存在两个边界问题，本轮修复：
+
+- **问题 1：partial 被 watching 吞掉**
+  - 旧 `GET_STATUS` 优先级为 `watching && translated > 0 → watching`，首次翻译
+    若为 `partial`（如 95 成功 / 5 失败），watcher 一启动状态即被改写为 `watching`，
+    popup 看不到 `partial`，再次点击 Translate 直接短路，失败的 5 条永久无法重试
+  - 修复：`partial` 改为**独立业务状态**，不再由 `sessionProgress.status` 推断，
+    而由「仍失败、等待显式重试的 anchor 集合」`catchupSkipAnchors` 推导
+  - 新 `GET_STATUS` 优先级：
+    `translating / dynamic-translating > partial > watching > translated > idle`
+  - `partial` 与 `watching` **不互斥**：页面可同时 `status="partial"` 且 `watching=true`。
+    popup 对 `partial` 不清空、不 `LAT_RESET`，继续发送 `TRANSLATE_PAGE`，
+    只重新 collect 未成功 / 未标记 source 的 record；补齐后恢复 `watching`；
+    仍有失败则继续保持 `partial`
+- **问题 2：translated 但 watcher 丢失后无法重新开启**
+  - 场景：页面已有译文 → 扩展 reload / content script 重新注入 → DOM 译文仍在，
+    但新 content script 内 `watching=false`。旧 popup 对 `translated` 直接 return，
+    用户点击 Translate 无法重新开启 watcher
+  - 修复：popup 仅在 `status === "watching"` 时真正短路；对
+    `status === "translated" && watching === false` 不 `LAT_RESET`、但继续发送
+    `TRANSLATE_PAGE`。content 侧发现 `records.length === 0 && already > 0`，
+    调用 `startWatching()` 并返回 `alreadyTranslated + watching=true`——
+    不调用模型、不删除旧译文，仅恢复 watcher
+- **防无限重试循环（实现细节）**：`partial` 期间把失败的 anchor 登记进
+  `catchupSkipAnchors`，`collectRecords` 跳过它们；因此 observer / 初始 catch-up
+  既**不会**自动重试已失败 record（否则会无限循环），也**仍会**翻译该期间新增的 DOM。
+  用户再次点击 Translate 时清空该集合，显式重试。`pruneCatchupSkip()` 会在每轮结束时
+  剪除已成功 / 已断开的 anchor，并由剩余集合推导 `partial`，避免「后续成功轮次误清 partial」
+
+## 当前实际配置（v0.2.1）
 
 以 `browser-extension/config.js` 为事实来源（**本文件数值与其保持同步**）：
 
@@ -87,7 +152,7 @@ Tool Calling、截图 / Vision 等。
   最终翻译范围（整页仍全部翻译）。仅在翻译开始时计算一次优先级，不做滚动监听
 - 性能日志：console 输出 `viewport-first: visibleRecords/nearRecords/restRecords/firstBatchChars`、
   `first translation visible in Ns`、`total translation time Ns`
-- **Dynamic Content（v0.2.0）**：首次整页翻译完成后启动 `MutationObserver`
+- **Dynamic Content（v0.2.0 引入）**：首次整页翻译完成后启动 `MutationObserver`
   （`document.body`，`childList + subtree`，**不监听 `characterData`**）。
   observer 回调只做轻量判断 + debounce（默认 750ms，`mutationDebounceMs`），
   到点后复用同一套 `collectRecords` / 过滤 / 锚点 / 去重 / 分批 / 插入，
@@ -96,9 +161,14 @@ Tool Calling、截图 / Vision 等。
   `dynamic translation done` / `dynamic watcher stopped`
 - **防反馈循环**：observer 忽略 `.local-ai-translation` 自身及其内部节点产生的
   mutation（插件自己插入/删除译文不会再次进入队列）
-- **单飞（single-flight）**：同一 content script 内始终最多一个翻译循环；
+- **单飞（single-flight）**：同一 content script 内始终最多一个「当前会话」翻译循环；
   首次翻译或动态翻译运行中到达的新 DOM 只标记 `dirty`，待当前循环结束后再 collect；
-  动态翻译期间再次新增会再排一轮，**不并发调用 Ollama**
+  动态翻译期间再次新增会再排一轮，**不并发调用 Ollama**。
+  跨会话（Restore 后新翻译）可能短暂与已作废的旧请求重叠，但旧请求结果会被
+  generation 检查丢弃（见 v0.2.1 P1-2）
+- **动态新增 DOM 无遗漏（v0.2.1 P1-1）**：首次整页翻译完成后立即
+  `startWatching()` 并主动触发一次 catch-up 扫描，保证首次翻译窗口内新增的
+  DOM 一定被补翻，不依赖后续 mutation
 - 每批完成后**立即插入**该批译文（不等待整页完成）
 - 明确 ID 的 JSON 批量协议：输入 `[{id, text}]` → 输出 `[{id, translation}]`
 - 调用 `POST /api/chat`，`think = false`，`stream = false`，
@@ -179,6 +249,11 @@ content.js ─┘                                （唯一访问 Ollama 的地�
   译文会正常插入页面）
 - 重新翻译会先清空旧译文（`LAT_RESET`）再从头翻译；已全部翻译的页面重复点击
   只提示「当前页面已翻译」，不重新请求
+- 页面为 `partial`（部分译文 + 部分失败）时再次点击翻译不会清空已有译文，
+  只重试失败的 record；`partial` 期间自动 watcher 不会自动重试失败 record
+  （避免无限重试循环），需用户再次点击翻译显式重试
+- `translated` 但 watcher 丢失（扩展 reload / content script 重新注入）时，
+  再次点击翻译会恢复 watcher，不重译、不删除已有译文
 
 ## 下一阶段候选
 
@@ -188,11 +263,11 @@ content.js ─┘                                （唯一访问 Ollama 的地�
 - 流式逐段回显
 - 桌面助手 / 本地文件 RAG / Tool Calling / Vision（长期目标）
 
-## Scope Audit（v0.2.0）
+## Scope Audit（v0.2.1）
 
 **NO** —— 未超出本轮范围。
 
-本轮仅实现 Dynamic Content（MutationObserver + debounce + 单飞增量翻译），
-未实现任何禁止功能：无右键翻译 / 划词翻译 / 设置页 / 多模型 UI / 语言选择 /
-翻译缓存 / OCR / PDF / 语音 / 桌面助手 / RAG / Agent / MCP / 云 API /
-history router patch / 复杂任务队列 / 并发 Ollama 请求。
+本轮仅做稳定性 hotfix（P1-1 初始翻译 catch-up、P1-2 会话 generation 隔离、
+P2 重复点击幂等 + partial 状态机补充修复），未新增任何功能：无翻译缓存 / 划词翻译 /
+右键菜单 / 设置页 / 多模型 UI / 语言选择 / `addedNodes` 局部扫描优化 / streaming /
+OCR / PDF / RAG / Agent / 桌面助手 / history router hook / 新架构。

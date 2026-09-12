@@ -5,15 +5,17 @@
 
 ## 当前状态
 
-**Browser Translator v0.2.0**
+**Browser Translator v0.2.1**
 
 一个 Chrome / Chromium 浏览器扩展（Manifest V3），用于将英文网页正文
 翻译为中文。原文保留，中文译文显示在原文下方，可一键恢复原文。
 
 - **Viewport First（v0.1.2）**：点击翻译后，当前屏幕内容优先出现中文
-- **Dynamic Content（v0.2.0）**：首次翻译完成后，自动增量翻译页面新加载的内容
+- **Dynamic Content（v0.2.0 引入）**：首次翻译完成后，自动增量翻译页面新加载的内容
   （无限滚动 / SPA 局部更新），无需再次点击。用户主动点击翻译后才开始监听；
   页面完整刷新后需重新点击。
+- **v0.2.1**：稳定性修复（初始翻译窗口内新增 DOM 补翻、会话 generation 隔离、
+  重复点击 Translate 幂等），无新功能。
 
 > 范围仍限定为「浏览器本地 AI 翻译插件」。
 > 桌面助手 / RAG / Tool Calling / Vision / 截图翻译等均为后续阶段。
@@ -72,6 +74,31 @@
 
 > 页面完整刷新或整站跳转后，需重新点击 **翻译当前页面**。
 
+## 开发 / 回归测试
+
+自动化回归测试仅用于**开发**，加载真实的 `config.js` + `content.js` 到
+[jsdom](https://github.com/jsdom/jsdom) 中运行，不依赖本机 Chrome / Ollama。
+
+```bash
+npm ci
+npm test
+```
+
+`npm test` 顺序执行完整测试集（Run 33 / Dynamic 35 / Footer 34 / Viewport 26 /
+State 45，共 173 checks）。也可单独运行：
+
+```bash
+npm run test:race
+npm run test:dynamic
+npm run test:footer
+npm run test:viewport
+npm run test:state
+```
+
+> `package.json` 与 `node_modules/` **仅供测试 / 开发**。
+> 浏览器扩展本身仍是原生 HTML / CSS / JavaScript，无 bundler、无构建步骤、
+> 无运行时 npm 依赖。
+
 ## 安全说明
 
 - **所有 AI 推理都在本机 Ollama 中进行**，不向任何云服务发送网页内容。
@@ -94,7 +121,13 @@ local-ai-assistant/
 ├─ docs/
 │  └─ DEVELOPMENT_STATUS.md
 ├─ test/
-│  └─ dynamic-test-page.html   动态内容手动测试页（Load More 追加 10 张卡片）
+│  ├─ dynamic-test-page.html   动态内容手动测试页（Load More 追加 10 张卡片）
+│  ├─ race-test.js             会话竞态 / generation 隔离
+│  ├─ dynamic-test.js          动态内容增量翻译
+│  ├─ footer-test.js           页脚提取与过滤
+│  ├─ viewport-test.js         Viewport First 优先级
+│  └─ state-test.js            partial / watching 状态机
+├─ package.json                测试脚本 + jsdom（devDependencies，仅供开发）
 ├─ .gitignore
 └─ README.md
 ```

@@ -180,11 +180,34 @@
       }
 
       setStatus("正在翻译...", "warn");
-      // 开始新任务前清掉旧译文与旧会话，保证状态干净且不产生重复
+
+      // 只在「已完成且在监听」时真正短路（幂等：不清空、不请求模型、不重译）。
+      // 其他情况一律继续发送 TRANSLATE_PAGE：
+      // - partial：保留已有译文，只补翻尚未成功 / 未标记 source 的 record
+      // - translated 但 watching=false（content script 重载后 watcher 丢失）：
+      //   由 content 侧发现无新 record 并重新 arm watcher，不删旧译文、不调用模型
+      // - idle / 未翻译：正常首次翻译
+      let skipReset = false;
       try {
-        await sendToTab(currentTabId, { type: "LAT_RESET" });
+        const st = await sendToTab(currentTabId, { type: "GET_STATUS" });
+        if (st && st.ok && st.status === "watching") {
+          setStatus("翻译完成 · 正在监听新内容", "ok");
+          return;
+        }
+        if (st && st.ok && (st.status === "partial" || st.status === "translated")) {
+          skipReset = true;
+        }
       } catch (e) {
-        console.warn("[LAT] 重置旧译文失败（可忽略）:", e && e.message);
+        console.warn("[LAT] 读取页面状态失败（继续翻译）:", e && e.message);
+      }
+
+      // 开始新任务前清掉旧译文与旧会话，保证状态干净且不产生重复
+      if (!skipReset) {
+        try {
+          await sendToTab(currentTabId, { type: "LAT_RESET" });
+        } catch (e) {
+          console.warn("[LAT] 重置旧译文失败（可忽略）:", e && e.message);
+        }
       }
 
       const resp = await sendToTab(currentTabId, { type: "TRANSLATE_PAGE" });
@@ -198,7 +221,11 @@
         return;
       }
       if (resp.failed > 0) {
-        setStatus("部分内容翻译失败，可重试。已翻译 " + resp.translated + " / " + resp.total + " 段。", "warn");
+        setStatus(
+          "部分内容翻译失败，可重试。已翻译 " + resp.translated + " / " + resp.total + " 段。" +
+          (resp.watching ? "（继续监听新内容）" : ""),
+          "warn"
+        );
       } else if (resp.watching) {
         setStatus("翻译完成 · 正在监听新内容", "ok");
       } else {
@@ -250,6 +277,11 @@
       setStatus("发现新内容，正在翻译... 已完成 " + (p.done || 0) + " / " + (p.total || 0) + " 段", "warn");
     } else if (p.status === "watching") {
       setStatus("翻译完成 · 正在监听新内容", "ok");
+      translating = false;
+      refreshButtons();
+    } else if (p.status === "partial") {
+      // partial 可能带有 watching=true：保留「监听中」提示，同时说明仍有失败可重试
+      setStatus("部分内容翻译失败，可重试" + (translating && p.total ? "（" + (p.done || 0) + " / " + p.total + " 段）" : ""), "warn");
       translating = false;
       refreshButtons();
     } else if (translating && p.status === "translating") {

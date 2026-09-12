@@ -54,16 +54,34 @@
   ].join(",");
   const PRUNE_SELECTOR = (CFG.pruneSelectors || []).join(",");
 
-  let cancelRequested = false;
   let session = null;
   let sessionProgress = { status: "idle", done: 0, total: 0 };
   let lastError = "";
+  // 会话 generation：Restore / LAT_RESET / 每次新翻译都会递增。
+  // 所有 async 翻译循环在 await 之后必须核对自己的 generation，
+  // 不匹配即视为 stale，丢弃结果且不得修改任何会话状态（见 v0.2.1 P1-2）。
+  let sessionGeneration = 0;
+
+  /** 当前 async 循环是否仍属于最新会话。stale 循环必须放弃一切状态写入。 */
+  function isCurrentSession(gen) {
+    return gen === sessionGeneration;
+  }
 
   // ---- 动态内容监听（v0.2）----
   let observer = null;        // MutationObserver 实例
   let watching = false;       // 是否处于监听状态
   let dirty = false;          // 是否观察到尚未处理的新增内容
   let dynamicTimer = null;    // debounce 定时器
+
+  // ---- partial 业务状态（v0.2.1 P2 补充）----
+  // 上一次翻译/动态翻译运行结束时仍有失败 record。这是一个独立的业务状态，
+  // 与 watching 不互斥：页面可以同时 status="partial" 且 watching=true。
+  // 运行中（session.running）不设置本标记，由 getStatus 优先返回 translating。
+  let partialPending = false;
+  // catch-up 需要跳过的 anchor。动态翻译运行期间，若这些 anchor 再次被标记 dirty，
+  // observer / catch-up 不得重试它们，否则失败 record 会陷入无限重试循环。
+  // 用户再次点击 Translate 时清空（显式重试）。
+  let catchupSkipAnchors = new Set();
 
   /* ------------------------------------------------------------------ */
   /* 文本判定                                                            */
@@ -144,6 +162,18 @@
     return !!(next && next.classList.contains(CFG.translationClass));
   }
 
+  /** 锚点是否仍需要翻译（未断开、无译文、未标记 source）。用于 partial 追踪剪枝。 */
+  function anchorStillNeedsWork(anchor) {
+    return !!anchor && anchor.isConnected && !hasTranslation(anchor) && !anchor.hasAttribute(CFG.sourceAttr);
+  }
+
+  /** 剪除已成功 / 已断开的 anchor；剩余集合即「仍然失败、等待显式重试」的 record。 */
+  function pruneCatchupSkip() {
+    catchupSkipAnchors.forEach((a) => {
+      if (!anchorStillNeedsWork(a)) catchupSkipAnchors.delete(a);
+    });
+  }
+
   /* ------------------------------------------------------------------ */
   /* 提取                                                                */
   /* ------------------------------------------------------------------ */
@@ -177,6 +207,8 @@
       if (!anchor || !anchor.parentNode) continue;
       if (anchor.hasAttribute(CFG.sourceAttr)) continue;
       if (hasTranslation(anchor)) continue;
+      // partial 会话：自动 retry 跳过本轮已知失败的 anchor（用户显式重试会清空该集合）
+      if (catchupSkipAnchors.has(anchor)) continue;
       if (!isVisible(anchor)) continue;
 
       const piece = normalize(node.nodeValue);
@@ -387,19 +419,24 @@
 
   function scheduleDynamic(delay) {
     if (!watching) return;
+    // 捕获当前 generation：debounce 到点时若会话已换代，回调直接作废
+    const gen = sessionGeneration;
     if (dynamicTimer) clearTimeout(dynamicTimer);
     dynamicTimer = setTimeout(() => {
       dynamicTimer = null;
+      if (!isCurrentSession(gen)) return;
       runDynamicOnce();
     }, delay);
   }
 
-  /** 由 popup 明确要求恢复：停止监听 + 取消会话 + 删除译文（其请求结果不再插入）。 */
+  /** 由 popup 明确要求恢复：停止监听 + 换代作废在途请求 + 删除译文。 */
   function restorePage() {
     stopWatching();
-    cancelRequested = true;              // 进行中的批次在插入前会检查此标志
+    sessionGeneration++;                 // 作废所有在途 async 循环
     const r = restoreOriginal();
-    if (session) session.running = false;
+    partialPending = false;
+    catchupSkipAnchors.clear();
+    session = null;
     sessionProgress = { status: "idle", done: 0, total: 0 };
     return r;
   }
@@ -419,13 +456,17 @@
    */
   async function drainDynamic() {
     if (!watching) return;
+
+    const myGen = sessionGeneration;
+    const mySession = { running: true };
+    session = mySession;
     dirty = false;
 
     const records = collectRecords();
-    if (!records.length) return;
-
-    session = { running: true };
-    cancelRequested = false;
+    if (!records.length) {
+      if (isCurrentSession(myGen)) session = null;
+      return;
+    }
 
     const batches = buildBatches(records, CFG.batchCharLimit);
 
@@ -434,9 +475,11 @@
 
     let translated = 0;
     let failed = 0;
+    const failedAnchors = [];
 
     for (let i = 0; i < batches.length; i++) {
-      if (cancelRequested || !watching) break;
+      // stale 会话（Restore / 新翻译）：立即退出，绝不写入任何状态
+      if (!isCurrentSession(myGen) || !watching) break;
 
       const batch = batches[i].filter((r) => {
         if (r.text.length > CFG.hardTextLimit) {
@@ -450,8 +493,8 @@
       batch.forEach((r) => r.anchor.classList.add("local-ai-translating"));
       try {
         const byId = await requestBatch(batch);
-        // Restore 已发生：请求结果作废，不插入
-        if (cancelRequested || !watching) {
+        // stale：丢弃结果，不插入、不改 session / progress
+        if (!isCurrentSession(myGen) || !watching) {
           batch.forEach((r) => r.anchor.classList.remove("local-ai-translating"));
           break;
         }
@@ -463,22 +506,36 @@
             translated++;
           } else {
             failed++;
+            failedAnchors.push(r.anchor);
           }
           r.anchor.classList.remove("local-ai-translating");
         });
       } catch (e) {
         console.error(TAG, "动态批次翻译失败:", e);
         failed += batch.length;
-        batch.forEach((r) => r.anchor.classList.remove("local-ai-translating"));
+        batch.forEach((r) => { failedAnchors.push(r.anchor); r.anchor.classList.remove("local-ai-translating"); });
       }
+      if (!isCurrentSession(myGen)) break;
       sendProgress({ status: "dynamic-translating", done: translated, total: records.length, batch: i + 1, batches: batches.length });
     }
 
-    session.running = false;
+    // stale 循环到此为止：不碰 session.running / watching / progress
+    if (!isCurrentSession(myGen)) return;
+
+    session = null;
     console.log(TAG + " dynamic translation done: " + translated + " records");
+
+    // 本次动态翻译仍失败的 anchor 加入 catchup 跳过集合，防止 observer / catch-up
+    // 自动重试造成无限循环。用户再次点击 Translate 会清空该集合并显式重试。
+    failedAnchors.forEach((a) => catchupSkipAnchors.add(a));
+    // 剪除已被翻译 / 已断开的 anchor，再由剩余失败集推导 partial。
+    pruneCatchupSkip();
+    partialPending = catchupSkipAnchors.size > 0;
+
     if (watching) {
-      sendProgress({ status: "watching", done: translated, total: records.length });
-      // 本轮翻译期间又出现新增内容：再排一轮增量
+      sendProgress({ status: partialPending ? "partial" : "watching", done: translated, total: records.length });
+      // 本轮翻译期间又出现新增内容：再排一轮增量。
+      // catchupSkipAnchors 保证本轮已失败的 anchor 不会被自动重试，避免无限循环。
       if (dirty) scheduleDynamic(0);
     }
   }
@@ -503,8 +560,15 @@
 
     const already = document.querySelectorAll("." + CFG.translationClass).length;
 
-    session = { running: true };
-    cancelRequested = false;
+    // 新的一轮用户发起翻译：清空上一轮的 partial 状态与自动 retry 跳过集合，
+    // 让本次可以显式重试此前失败的 record。
+    partialPending = false;
+    catchupSkipAnchors.clear();
+
+    // 开启新会话：换代（作废任何在途旧循环），并持有自己的 generation
+    const myGen = ++sessionGeneration;
+    const mySession = { running: true };
+    session = mySession;
     lastError = "";
 
     const t0 = performance.now();
@@ -512,9 +576,9 @@
     const totalChars = records.reduce((s, r) => s + r.text.length, 0);
 
     if (!records.length) {
-      session.running = false;
+      // 无新内容可翻（多为已翻译页面）：结束本次会话并（重新）开启监听
+      if (isCurrentSession(myGen)) session = null;
       if (already > 0) {
-        // 页面已翻译：视为用户重新开启监听
         if (CFG.dynamicTranslateEnabled) startWatching();
         return { ok: false, alreadyTranslated: true, watching, error: "当前页面已翻译。" };
       }
@@ -547,11 +611,13 @@
     let translated = 0;
     let failed = 0;
     let skipped = 0;
+    const failedAnchors = [];            // partial 时进入自动 retry 跳过集合
     let firstTranslationVisibleMs = null;
     let firstBatchDone = false;
 
     for (let i = 0; i < batches.length; i++) {
-      if (cancelRequested) break;
+      // 换代即退出（不加日志、不写任何状态）
+      if (!isCurrentSession(myGen)) break;
       const batch = batches[i];
 
       const usable = [];
@@ -575,10 +641,10 @@
       const bt0 = performance.now();
       try {
         const byId = await requestBatch(usable);
-        // Restore 已发生（cancelRequested）：请求结果作废，不插入
-        if (cancelRequested) {
+        // stale（Restore / 新会话已开始）：丢弃结果，不插图、不写状态，立即退出
+        if (!isCurrentSession(myGen)) {
           usable.forEach((r) => r.anchor.classList.remove("local-ai-translating"));
-          break;
+          return { ok: false, stale: true, cancelled: true };
         }
         usable.forEach((r) => {
           const translation = byId.get(r.id);
@@ -588,14 +654,19 @@
             translated++;
           } else {
             failed++;
+            failedAnchors.push(r.anchor);
           }
           r.anchor.classList.remove("local-ai-translating");
         });
       } catch (e) {
+        if (!isCurrentSession(myGen)) {
+          usable.forEach((r) => r.anchor.classList.remove("local-ai-translating"));
+          return { ok: false, stale: true, cancelled: true };
+        }
         console.error(TAG, "批次翻译失败:", e);
         lastError = e && e.message ? e.message : String(e);
         failed += usable.length;
-        usable.forEach((r) => r.anchor.classList.remove("local-ai-translating"));
+        usable.forEach((r) => { failedAnchors.push(r.anchor); r.anchor.classList.remove("local-ai-translating"); });
         // 保留已翻译部分，继续后续批次
       }
       const btMs = Math.round(performance.now() - bt0);
@@ -621,7 +692,11 @@
       });
     }
 
-    session.running = false;
+    // 循环因换代而中断（Restore 或新会话已开始）：本会话已作废，
+    // 绝不继续写 session / 启动 watcher / 覆盖 progress。
+    if (!isCurrentSession(myGen)) {
+      return { ok: false, stale: true, cancelled: true };
+    }
 
     const totalMs = Math.round(performance.now() - t0);
     console.log(
@@ -635,18 +710,27 @@
       console.log(TAG + " total translation time " + (totalMs / 1000).toFixed(1) + "s");
     }
 
-    if (cancelRequested) {
-      sendProgress({ status: "restored", done: 0, total: 0 });
-      return { ok: true, translated, failed, skipped, total, cancelled: true };
-    }
-
     const hasWork = translated + failed > 0;
     const status = !hasWork ? "error" : failed === 0 ? "translated" : "partial";
 
-    // 首次整页翻译完成后才开始监听后续新增 DOM
-    if (CFG.dynamicTranslateEnabled) startWatching();
+    session = null;
 
-    sendProgress({ status: watching ? "watching" : status, done: translated, total });
+    // partial 是独立业务状态，不会被后续 watcher 覆盖：本会话仍有失败 record
+    // 时登记它们并置位，自动 retry（observer / catch-up）将跳过它们，避免无限循环。
+    failedAnchors.forEach((a) => catchupSkipAnchors.add(a));
+    pruneCatchupSkip();
+    partialPending = catchupSkipAnchors.size > 0;
+
+    // 首次整页翻译完成后才正式进入监听；随后立即做一次 catch-up，
+    // 补翻「本次翻译期间新增、但 observer 尚未启动」的 DOM（见 v0.2.1 P1-1）。
+    if (CFG.dynamicTranslateEnabled) {
+      startWatching();
+      dirty = true;
+      scheduleDynamic(0);
+    }
+
+    // watching 与 partial 不互斥：partial 优先上报，watcher 照常保持开启
+    sendProgress({ status: watching ? (partialPending ? "partial" : "watching") : status, done: translated, total });
 
     return {
       ok: translated > 0,
@@ -681,9 +765,11 @@
   /** 完全取消当前会话（重新翻译前调用，确保旧批次停止且清空旧译文）。 */
   function resetSession() {
     stopWatching();
-    cancelRequested = true;
+    sessionGeneration++;                 // 作废所有在途 async 循环
     const r = restoreOriginal();
-    if (session) session.running = false;
+    partialPending = false;
+    catchupSkipAnchors.clear();
+    session = null;
     sessionProgress = { status: "idle", done: 0, total: 0 };
     return r;
   }
@@ -692,13 +778,17 @@
   function getStatus() {
     const translated = document.querySelectorAll("." + CFG.translationClass).length;
     const running = !!(session && session.running);
+    // 优先级：translating / dynamic-translating > partial > watching > translated > idle
+    // partial 是独立业务状态，不能被 watching 覆盖（页面可同时 partial + watching）。
     let status = "idle";
     if (running) {
       status = sessionProgress.status === "dynamic-translating" ? "dynamic-translating" : "translating";
+    } else if (partialPending) {
+      status = "partial";
     } else if (watching && translated > 0) {
       status = "watching";
     } else if (translated > 0) {
-      status = sessionProgress.status === "partial" ? "partial" : "translated";
+      status = "translated";
     }
     return { ok: true, status, watching, translated, progress: sessionProgress };
   }
@@ -711,7 +801,7 @@
     if (!msg || !msg.type) return false;
 
     if (msg.type === "PING") {
-      sendResponse({ ok: true, version: "0.2.0" });
+      sendResponse({ ok: true, version: "0.2.1" });
       return false;
     }
     if (msg.type === "TRANSLATE_PAGE") {
