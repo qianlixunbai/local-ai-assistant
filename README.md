@@ -5,12 +5,17 @@
 
 ## 当前状态
 
-**Browser Translator MVP**（第一轮）
+**Browser Translator v0.2.0**
 
 一个 Chrome / Chromium 浏览器扩展（Manifest V3），用于将英文网页正文
 翻译为中文。原文保留，中文译文显示在原文下方，可一键恢复原文。
 
-> 本轮范围严格限制为「浏览器本地 AI 翻译插件初版」。
+- **Viewport First（v0.1.2）**：点击翻译后，当前屏幕内容优先出现中文
+- **Dynamic Content（v0.2.0）**：首次翻译完成后，自动增量翻译页面新加载的内容
+  （无限滚动 / SPA 局部更新），无需再次点击。用户主动点击翻译后才开始监听；
+  页面完整刷新后需重新点击。
+
+> 范围仍限定为「浏览器本地 AI 翻译插件」。
 > 桌面助手 / RAG / Tool Calling / Vision / 截图翻译等均为后续阶段。
 
 ## 环境要求
@@ -60,8 +65,12 @@
 2. 点击浏览器工具栏中的扩展图标
 3. 点击 **检测连接** —— 确认 `Ollama：在线`、`模型：可用`
 4. 点击 **翻译当前页面**
-5. 英文原文保留，原文下方出现自然中文译文
-6. 点击 **恢复原文** 移除全部译文
+5. 英文原文保留，原文下方出现自然中文译文（当前屏幕内容优先）
+6. 翻译完成后状态变为 **翻译完成 · 正在监听新内容**；页面新加载的内容
+   （无限滚动 / SPA 局部更新）会自动增量翻译，无需再次点击
+7. 点击 **恢复原文** 移除全部译文并停止监听
+
+> 页面完整刷新或整站跳转后，需重新点击 **翻译当前页面**。
 
 ## 安全说明
 
@@ -77,13 +86,15 @@ local-ai-assistant/
 │  ├─ manifest.json
 │  ├─ config.js           集中配置（Ollama 地址 / 模型名 / 批次参数）
 │  ├─ background.js       service worker：注入 content script
-│  ├─ content.js          正文提取 / 批量翻译 / 双语插入 / 恢复
+│  ├─ content.js          正文提取 / 批量翻译 / 双语插入 / 恢复 / 动态内容监听
 │  ├─ content.css         译文样式（仅作用于 .local-ai-translation）
 │  ├─ popup.html
 │  ├─ popup.css
 │  └─ popup.js            popup 逻辑与 Ollama 连接检测
 ├─ docs/
 │  └─ DEVELOPMENT_STATUS.md
+├─ test/
+│  └─ dynamic-test-page.html   动态内容手动测试页（Load More 追加 10 张卡片）
 ├─ .gitignore
 └─ README.md
 ```

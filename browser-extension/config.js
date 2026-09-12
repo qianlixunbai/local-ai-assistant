@@ -41,6 +41,14 @@
     // 仅用于排序分组，不做滚动监听 / 虚拟滚动。
     viewportPaddingRatio: 1.0,
 
+    // ---- Dynamic Content (v0.2) ----
+    // 用户主动点击「翻译当前页面」后，监听后续新增 DOM 并增量翻译。
+    // 仅在翻译会话期间生效；Restore 会停止监听。当前固定开启，无设置页。
+    dynamicTranslateEnabled: true,
+    // 观察到新增 DOM 后的合并延迟（毫秒）。避免一次渲染几十上百个
+    // mutation 时逐个触发模型请求。
+    mutationDebounceMs: 750,
+
     // 单个文本块超过该长度则单独成批，避免过长的单条。
     singleTextLimit: 5000,
     // 超过该长度的单条直接跳过（防止一个超长节点拖垮整页）

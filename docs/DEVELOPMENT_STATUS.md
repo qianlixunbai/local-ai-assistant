@@ -1,11 +1,20 @@
 # Development Status
 
-## 版本状态（v0.1.2）
+## 版本状态（v0.2.0）
 
-**Result: PARTIAL** —— 在真实 Chrome / SEEK 页面完成人工验收之前，Browser Translator
-v0.1.2 不标记为 GO / PASS。代码与自动化测试（jsdom）已通过，真实浏览器端到端验收待办。
+**Result: GO** —— Browser Translator v0.2.0 已通过真实 Chrome 人工验收。
 
-## 当前实际配置（v0.1.2）
+真实 Chrome 人工验收通过项：
+
+- 初始页面翻译正常
+- `Load More Jobs` 新增内容可自动翻译（MutationObserver 动态翻译正常）
+- Restore 正常
+- Restore 后停止动态翻译（watcher 已 disconnect）
+- 重新 Translate 后 watcher 可再次启动
+
+自动化测试（jsdom）同样通过（Dynamic 35 / Footer 34 / Viewport 26）。
+
+## 当前实际配置（v0.2.0）
 
 以 `browser-extension/config.js` 为事实来源（**本文件数值与其保持同步**）：
 
@@ -20,6 +29,8 @@ v0.1.2 不标记为 GO / PASS。代码与自动化测试（jsdom）已通过，�
 | `think` | `false` |
 | `stream` | `false` |
 | `keep_alive` | `"30m"` |
+| `dynamicTranslateEnabled` | `true` |
+| `mutationDebounceMs` | `750` |
 
 ## 模型选择说明
 
@@ -76,6 +87,18 @@ Tool Calling、截图 / Vision 等。
   最终翻译范围（整页仍全部翻译）。仅在翻译开始时计算一次优先级，不做滚动监听
 - 性能日志：console 输出 `viewport-first: visibleRecords/nearRecords/restRecords/firstBatchChars`、
   `first translation visible in Ns`、`total translation time Ns`
+- **Dynamic Content（v0.2.0）**：首次整页翻译完成后启动 `MutationObserver`
+  （`document.body`，`childList + subtree`，**不监听 `characterData`**）。
+  observer 回调只做轻量判断 + debounce（默认 750ms，`mutationDebounceMs`），
+  到点后复用同一套 `collectRecords` / 过滤 / 锚点 / 去重 / 分批 / 插入，
+  仅翻译新增 record；动态批次直接用 2800 上限（不套用 Viewport First 的 1000 首批）。
+  日志：`dynamic watcher started` / `mutations detected` / `dynamic collect` /
+  `dynamic translation done` / `dynamic watcher stopped`
+- **防反馈循环**：observer 忽略 `.local-ai-translation` 自身及其内部节点产生的
+  mutation（插件自己插入/删除译文不会再次进入队列）
+- **单飞（single-flight）**：同一 content script 内始终最多一个翻译循环；
+  首次翻译或动态翻译运行中到达的新 DOM 只标记 `dirty`，待当前循环结束后再 collect；
+  动态翻译期间再次新增会再排一轮，**不并发调用 Ollama**
 - 每批完成后**立即插入**该批译文（不等待整页完成）
 - 明确 ID 的 JSON 批量协议：输入 `[{id, text}]` → 输出 `[{id, translation}]`
 - 调用 `POST /api/chat`，`think = false`，`stream = false`，
@@ -123,7 +146,18 @@ content.js ─┘                                （唯一访问 Ollama 的地�
 ## 已知限制
 
 - 当前只处理**用户点击时刻已存在**的 DOM
-- 不支持动态新增内容（无 MutationObserver / 无限滚动 / SPA 路由监听）
+- **v0.2.0 起支持动态新增 DOM 的增量翻译**：用户主动点击「翻译当前页面」后，
+  插件通过 `MutationObserver`（`childList + subtree`）监听新增内容，
+  debounce 750ms 后仅收集**尚未翻译**的新 record 并增量翻译；已翻译内容不会重发。
+  限制：
+  - 页面完整 reload / 整站跳转后 content script 重新加载，需**重新点击翻译**
+  - 不做 URL / history router hook（不 monkey patch `pushState` / `popstate`）
+  - 不保证 Shadow DOM 内部
+  - 动态 collect 目前仍会对页面做一次完整 `TreeWalker` 扫描（未按 `addedNodes`
+    缩小扫描范围）；`hasTranslation` / `data-local-ai-source` 保证不重发已翻译内容，
+    正确性不受影响，仅在超大页面 + 极高频新增时可能偏重
+  - MutationObserver **仅在用户主动开启一次翻译后生效**；未点击翻译不会自动翻译任何页面
+  - Restore 会停止监听；再次点击翻译可重新开启
 - 不保证适配所有网站，目标为 Wikipedia / 博客 / 新闻 / 技术文章类正文页面
 - 暂无翻译缓存；「翻译当前页面」对已翻译页面会提示已翻译，不会重译，
   但对 partial 页面会重新收集未翻译节点
@@ -151,15 +185,14 @@ content.js ─┘                                （唯一访问 Ollama 的地�
 - 设置页（模型选择、批次大小、目标语言）
 - 翻译缓存（按文本 hash）
 - 划词 / 右键菜单翻译
-- 动态内容支持（MutationObserver）
 - 流式逐段回显
 - 桌面助手 / 本地文件 RAG / Tool Calling / Vision（长期目标）
 
-## Scope Audit（v0.1.2）
+## Scope Audit（v0.2.0）
 
 **NO** —— 未超出本轮范围。
 
-本轮仅实现 Viewport First（viewport 优先级排序 + 首批约 1000 字符 + 本地性能日志），
-未实现任何禁止功能：无右键翻译 / 划词翻译 / 桌面助手 / RAG / Agent / MCP / OCR /
-PDF / 语音 / 多模型切换 UI / 设置页面 / 自动语言检测 / MutationObserver / SPA 监听 /
-滚动动态队列 / 云 API / 并发模型请求。
+本轮仅实现 Dynamic Content（MutationObserver + debounce + 单飞增量翻译），
+未实现任何禁止功能：无右键翻译 / 划词翻译 / 设置页 / 多模型 UI / 语言选择 /
+翻译缓存 / OCR / PDF / 语音 / 桌面助手 / RAG / Agent / MCP / 云 API /
+history router patch / 复杂任务队列 / 并发 Ollama 请求。

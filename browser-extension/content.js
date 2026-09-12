@@ -59,6 +59,12 @@
   let sessionProgress = { status: "idle", done: 0, total: 0 };
   let lastError = "";
 
+  // ---- 动态内容监听（v0.2）----
+  let observer = null;        // MutationObserver 实例
+  let watching = false;       // 是否处于监听状态
+  let dirty = false;          // 是否观察到尚未处理的新增内容
+  let dynamicTimer = null;    // debounce 定时器
+
   /* ------------------------------------------------------------------ */
   /* 文本判定                                                            */
   /* ------------------------------------------------------------------ */
@@ -143,12 +149,14 @@
   /* ------------------------------------------------------------------ */
 
   /**
-   * 遍历全部文本节点，聚合成 translation record。
-   * 返回数组 [{ id, text, anchor }]
+   * 遍历文本节点，聚合成 translation record。
+   * root 默认为 document.body（整页）；动态阶段可传入新增子树以缩小扫描范围。
+   * 返回数组 [{ id, text, anchor, domOrder }]
    */
-  function collectRecords() {
+  function collectRecords(root) {
+    const scope = root || document.body || document.documentElement;
     const walker = document.createTreeWalker(
-      document.body || document.documentElement,
+      scope,
       NodeFilter.SHOW_TEXT,
       null
     );
@@ -307,8 +315,175 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* 主流程                                                              */
+  /* 动态内容监听（v0.2）                                                */
   /* ------------------------------------------------------------------ */
+
+  /** mutation 节点是否由本插件产生（译文节点本身，或位于译文节点内部）。 */
+  function isOwnTranslationNode(node) {
+    const el = node.nodeType === 1 ? node : node.parentElement;
+    return !!(el && el.closest && el.closest("." + CFG.translationClass));
+  }
+
+  /**
+   * 观察到的 mutation 是否可能带来新的可翻译文本。
+   * 只做很轻的判断：忽略插件自身产生的 mutation（防止翻译↔观察反馈循环），
+   * 其余一律标记 dirty，交给 debounce 后的 collectRecords 过滤。
+   */
+  function mutationMightAddContent(mutations) {
+    for (const m of mutations) {
+      if (m.type !== "childList") continue;
+      if (isOwnTranslationNode(m.target)) continue;
+      const added = m.addedNodes;
+      for (let i = 0; i < added.length; i++) {
+        const n = added[i];
+        if (n.nodeType === 1) {
+          if (isOwnTranslationNode(n)) continue;
+          return true;
+        }
+        if (n.nodeType === 3 && normalize(n.nodeValue)) return true; // 直接插入的文本节点
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 启动监听。仅在用户主动翻译后调用。
+   * observer 回调只标记 dirty + schedule debounce，不做扫描 / 请求。
+   */
+  function startWatching() {
+    if (!CFG.dynamicTranslateEnabled) return;
+    if (watching) return;
+    if (typeof MutationObserver === "undefined") return;
+
+    watching = true;
+    dirty = false;
+    observer = new MutationObserver((mutations) => {
+      if (!watching) return;
+      if (!mutationMightAddContent(mutations)) return;
+      dirty = true;
+      scheduleDynamic(CFG.mutationDebounceMs);
+    });
+    observer.observe(document.body || document.documentElement, {
+      childList: true,
+      subtree: true
+    });
+    console.log(TAG + " dynamic watcher started");
+  }
+
+  /** 停止监听并清掉所有待处理状态（Restore 时调用）。 */
+  function stopWatching() {
+    if (dynamicTimer) {
+      clearTimeout(dynamicTimer);
+      dynamicTimer = null;
+    }
+    if (observer) {
+      observer.disconnect();
+      observer = null;
+    }
+    if (watching) console.log(TAG + " dynamic watcher stopped");
+    watching = false;
+    dirty = false;
+  }
+
+  function scheduleDynamic(delay) {
+    if (!watching) return;
+    if (dynamicTimer) clearTimeout(dynamicTimer);
+    dynamicTimer = setTimeout(() => {
+      dynamicTimer = null;
+      runDynamicOnce();
+    }, delay);
+  }
+
+  /** 由 popup 明确要求恢复：停止监听 + 取消会话 + 删除译文（其请求结果不再插入）。 */
+  function restorePage() {
+    stopWatching();
+    cancelRequested = true;              // 进行中的批次在插入前会检查此标志
+    const r = restoreOriginal();
+    if (session) session.running = false;
+    sessionProgress = { status: "idle", done: 0, total: 0 };
+    return r;
+  }
+
+  /** debounce 到点后在「无翻译循环运行」时触发一次动态翻译。 */
+  function runDynamicOnce() {
+    if (!watching || !CFG.dynamicTranslateEnabled) return;
+    if (session && session.running) return; // 有循环在跑：保留 dirty，待其结束后再处理
+    if (dirty) drainDynamic();
+  }
+
+  /**
+   * 收集尚未翻译的新增 record 并顺序翻译。与首次翻译共用
+   * collectRecords / isTranslatableText / findAnchor / hasTranslation /
+   * buildBatches / requestBatch / insertTranslation。
+   * 动态批次不使用 Viewport First 的小首批规则（record 通常较少）。
+   */
+  async function drainDynamic() {
+    if (!watching) return;
+    dirty = false;
+
+    const records = collectRecords();
+    if (!records.length) return;
+
+    session = { running: true };
+    cancelRequested = false;
+
+    const batches = buildBatches(records, CFG.batchCharLimit);
+
+    console.log(TAG + " dynamic collect: " + records.length + " new records, batches = " + batches.length);
+    sendProgress({ status: "dynamic-translating", done: 0, total: records.length, batch: 0, batches: batches.length });
+
+    let translated = 0;
+    let failed = 0;
+
+    for (let i = 0; i < batches.length; i++) {
+      if (cancelRequested || !watching) break;
+
+      const batch = batches[i].filter((r) => {
+        if (r.text.length > CFG.hardTextLimit) {
+          console.warn(TAG, "跳过超长文本（" + r.text.length + " 字符）:", r.text.slice(0, 80) + "…");
+          return false;
+        }
+        return true;
+      });
+      if (!batch.length) continue;
+
+      batch.forEach((r) => r.anchor.classList.add("local-ai-translating"));
+      try {
+        const byId = await requestBatch(batch);
+        // Restore 已发生：请求结果作废，不插入
+        if (cancelRequested || !watching) {
+          batch.forEach((r) => r.anchor.classList.remove("local-ai-translating"));
+          break;
+        }
+        batch.forEach((r) => {
+          const translation = byId.get(r.id);
+          if (typeof translation === "string" && translation.trim()) {
+            insertTranslation(r, translation.trim());
+            r.anchor.setAttribute(CFG.sourceAttr, "1");
+            translated++;
+          } else {
+            failed++;
+          }
+          r.anchor.classList.remove("local-ai-translating");
+        });
+      } catch (e) {
+        console.error(TAG, "动态批次翻译失败:", e);
+        failed += batch.length;
+        batch.forEach((r) => r.anchor.classList.remove("local-ai-translating"));
+      }
+      sendProgress({ status: "dynamic-translating", done: translated, total: records.length, batch: i + 1, batches: batches.length });
+    }
+
+    session.running = false;
+    console.log(TAG + " dynamic translation done: " + translated + " records");
+    if (watching) {
+      sendProgress({ status: "watching", done: translated, total: records.length });
+      // 本轮翻译期间又出现新增内容：再排一轮增量
+      if (dirty) scheduleDynamic(0);
+    }
+  }
+
+
 
   function sendProgress(partial) {
     sessionProgress = Object.assign({}, sessionProgress, partial);
@@ -339,7 +514,9 @@
     if (!records.length) {
       session.running = false;
       if (already > 0) {
-        return { ok: false, alreadyTranslated: true, error: "当前页面已翻译。" };
+        // 页面已翻译：视为用户重新开启监听
+        if (CFG.dynamicTranslateEnabled) startWatching();
+        return { ok: false, alreadyTranslated: true, watching, error: "当前页面已翻译。" };
       }
       return { ok: false, error: "未找到可翻译的英文正文。" };
     }
@@ -398,6 +575,11 @@
       const bt0 = performance.now();
       try {
         const byId = await requestBatch(usable);
+        // Restore 已发生（cancelRequested）：请求结果作废，不插入
+        if (cancelRequested) {
+          usable.forEach((r) => r.anchor.classList.remove("local-ai-translating"));
+          break;
+        }
         usable.forEach((r) => {
           const translation = byId.get(r.id);
           if (typeof translation === "string" && translation.trim()) {
@@ -460,7 +642,11 @@
 
     const hasWork = translated + failed > 0;
     const status = !hasWork ? "error" : failed === 0 ? "translated" : "partial";
-    sendProgress({ status, done: translated, total });
+
+    // 首次整页翻译完成后才开始监听后续新增 DOM
+    if (CFG.dynamicTranslateEnabled) startWatching();
+
+    sendProgress({ status: watching ? "watching" : status, done: translated, total });
 
     return {
       ok: translated > 0,
@@ -468,6 +654,7 @@
       failed,
       skipped,
       total,
+      watching,
       error: translated === 0 ? (lastError || "全部批次翻译失败。") : undefined
     };
   }
@@ -493,6 +680,7 @@
 
   /** 完全取消当前会话（重新翻译前调用，确保旧批次停止且清空旧译文）。 */
   function resetSession() {
+    stopWatching();
     cancelRequested = true;
     const r = restoreOriginal();
     if (session) session.running = false;
@@ -506,11 +694,13 @@
     const running = !!(session && session.running);
     let status = "idle";
     if (running) {
-      status = "translating";
+      status = sessionProgress.status === "dynamic-translating" ? "dynamic-translating" : "translating";
+    } else if (watching && translated > 0) {
+      status = "watching";
     } else if (translated > 0) {
       status = sessionProgress.status === "partial" ? "partial" : "translated";
     }
-    return { ok: true, status, translated, progress: sessionProgress };
+    return { ok: true, status, watching, translated, progress: sessionProgress };
   }
 
   /* ------------------------------------------------------------------ */
@@ -521,7 +711,7 @@
     if (!msg || !msg.type) return false;
 
     if (msg.type === "PING") {
-      sendResponse({ ok: true, version: "0.1.1" });
+      sendResponse({ ok: true, version: "0.2.0" });
       return false;
     }
     if (msg.type === "TRANSLATE_PAGE") {
@@ -532,7 +722,7 @@
     }
     if (msg.type === "RESTORE_PAGE") {
       try {
-        sendResponse(restoreOriginal());
+        sendResponse(restorePage());
       } catch (e) {
         sendResponse({ ok: false, error: e && e.message ? e.message : String(e) });
       }

@@ -190,11 +190,17 @@
       const resp = await sendToTab(currentTabId, { type: "TRANSLATE_PAGE" });
 
       if (!resp.ok && !resp.translated) {
-        setStatus(resp.alreadyTranslated ? "当前页面已翻译。" : (resp.error || "翻译失败。"), resp.alreadyTranslated ? "ok" : "err");
+        if (resp.alreadyTranslated) {
+          setStatus(resp.watching ? "翻译完成 · 正在监听新内容" : "当前页面已翻译。", "ok");
+        } else {
+          setStatus(resp.error || "翻译失败。", "err");
+        }
         return;
       }
       if (resp.failed > 0) {
         setStatus("部分内容翻译失败，可重试。已翻译 " + resp.translated + " / " + resp.total + " 段。", "warn");
+      } else if (resp.watching) {
+        setStatus("翻译完成 · 正在监听新内容", "ok");
       } else {
         setStatus("翻译完成，共 " + resp.translated + " 段。", "ok");
       }
@@ -239,7 +245,14 @@
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg || msg.type !== "TRANSLATION_PROGRESS") return;
     const p = msg.progress || {};
-    if (translating && p.status === "translating") {
+    if (p.status === "dynamic-translating") {
+      // 首次翻译完成后，页面新增内容被自动增量翻译
+      setStatus("发现新内容，正在翻译... 已完成 " + (p.done || 0) + " / " + (p.total || 0) + " 段", "warn");
+    } else if (p.status === "watching") {
+      setStatus("翻译完成 · 正在监听新内容", "ok");
+      translating = false;
+      refreshButtons();
+    } else if (translating && p.status === "translating") {
       const batch = p.batches ? "，第 " + (p.batch || 0) + " / " + p.batches + " 批" : "";
       setStatus("正在翻译" + batch + "... 已完成 " + (p.done || 0) + " / " + (p.total || 0) + " 段", "warn");
     } else if (translating && p.status === "translated") {
@@ -261,10 +274,12 @@
       const st = await sendToTab(currentTabId, { type: "GET_STATUS" });
       if (!st || !st.ok) return;
 
-      if (st.status === "translating") {
+      if (st.status === "translating" || st.status === "dynamic-translating") {
         translating = true;
         refreshButtons();
-        setStatus("正在翻译...", "warn");
+        setStatus(st.status === "dynamic-translating" ? "发现新内容，正在翻译..." : "正在翻译...", "warn");
+      } else if (st.status === "watching") {
+        setStatus("翻译完成 · 正在监听新内容", "ok");
       } else if (st.status === "translated") {
         setStatus("页面已翻译。", "ok");
       } else if (st.status === "partial") {

@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>LAT Dynamic Content Test Page</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 40px auto; line-height: 1.5; }
+    h1 { font-size: 22px; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px 16px; margin: 10px 0; }
+    .card a { font-weight: 600; text-decoration: none; color: #0b57d0; }
+    .meta { color: #666; font-size: 13px; margin-top: 4px; }
+    button { padding: 10px 16px; font-size: 15px; cursor: pointer; border-radius: 6px; border: 1px solid #0b57d0; background: #0b57d0; color: #fff; }
+    nav, footer { margin-top: 28px; padding-top: 16px; border-top: 1px solid #eee; }
+    nav a, footer a { margin-right: 14px; color: #0b57d0; }
+  </style>
+</head>
+<body>
+  <h1>Initial Jobs</h1>
+  <p>Find your next role today at a great company.</p>
+
+  <div id="feed">
+    <div class="card">
+      <a href="/job/1" target="_blank">Frontend Engineer</a>
+      <div class="meta"><span>Full time</span><span> · Sydney NSW</span></div>
+    </div>
+    <div class="card">
+      <a href="/job/2" target="_blank">Backend Developer</a>
+      <div class="meta"><span>Contract</span><span> · Melbourne VIC</span></div>
+    </div>
+  </div>
+
+  <button id="loadMore">Load More Jobs</button>
+
+  <nav>
+    <a href="/nav/home">Home</a>
+    <a href="/nav/companies">Companies</a>
+  </nav>
+
+  <footer>
+    <a href="/footer/help">Help centre</a>
+    <a href="/footer/about">About us</a>
+    <a href="/footer/newsroom">Newsroom</a>
+  </footer>
+
+  <script>
+    // Appends 10 job cards, mimicking an infinite-scroll / SPA "load more".
+    let page = 0;
+    const CITIES = ["Sydney NSW", "Melbourne VIC", "Brisbane QLD", "Perth WA", "Adelaide SA"];
+    const TYPES = ["Full time", "Part time", "Contract", "Casual"];
+    document.getElementById("loadMore").addEventListener("click", () => {
+      page++;
+      const feed = document.getElementById("feed");
+      for (let i = 0; i < 10; i++) {
+        const n = (page - 1) * 10 + i + 1;
+        const card = document.createElement("div");
+        card.className = "card";
+        card.innerHTML =
+          '<a href="/job/' + n + '" target="_blank">Job Title ' + n + '</a>' +
+          '<div class="meta"><span>' + TYPES[n % TYPES.length] + '</span>' +
+          '<span> · ' + CITIES[n % CITIES.length] + '</span></div>';
+        feed.appendChild(card);
+      }
+    });
+  </script>
+</body>
+</html>
