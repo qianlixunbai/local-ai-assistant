@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>Local AI Translator</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="header">
+    <h1>本地 AI 翻译</h1>
+    <p class="subtitle">Local AI Translator</p>
+  </header>
+
+  <section class="info">
+    <div class="row">
+      <span class="label">Ollama</span>
+      <span class="value">
+        <span class="dot" id="ollamaDot"></span>
+        <span id="ollamaStatus">未检测</span>
+      </span>
+    </div>
+    <div class="row">
+      <span class="label">模型</span>
+      <span class="value">
+        <span class="dot" id="modelDot"></span>
+        <span id="modelStatus">未检测</span>
+      </span>
+    </div>
+    <div class="row">
+      <span class="label">当前模型</span>
+      <span class="value" id="modelName">—</span>
+    </div>
+  </section>
+
+  <section class="actions">
+    <button id="btnTranslate" class="btn btn-primary">翻译当前页面</button>
+    <div class="sub-actions">
+      <button id="btnTest" class="btn btn-secondary">检测连接</button>
+      <button id="btnRestore" class="btn btn-secondary">恢复原文</button>
+    </div>
+  </section>
+
+  <section class="status">
+    <span class="status-label">状态</span>
+    <p id="statusText" class="status-text">准备就绪</p>  </section>
+
+  <script src="config.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

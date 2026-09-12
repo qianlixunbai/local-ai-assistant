@@ -1,0 +1,151 @@
+:root {
+  --bg: #1e1f26;
+  --bg-soft: #262832;
+  --border: #343744;
+  --text: #e8eaf0;
+  --text-dim: #9aa0b0;
+  --primary: #6b8afd;
+  --primary-hover: #7d99ff;
+  --ok: #35c46a;
+  --warn: #e0b341;
+  --err: #e05a5a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: 360px;
+  margin: 0;
+  padding: 16px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", Roboto, sans-serif;
+  font-size: 13px;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.header .subtitle {
+  margin: 2px 0 14px;
+  font-size: 11px;
+  color: var(--text-dim);
+  letter-spacing: 0.3px;
+}
+
+.info {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+}
+
+.row .label {
+  color: var(--text-dim);
+}
+
+.row .value {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.dot.ok { background: var(--ok); }
+.dot.warn { background: var(--warn); }
+.dot.err { background: var(--err); }
+
+.actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.sub-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.sub-actions .btn {
+  flex: 1;
+}
+
+.btn {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.15s, opacity 0.15s;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--primary);
+  color: #fff;
+}
+.btn-primary:not(:disabled):hover {
+  background: var(--primary-hover);
+}
+
+.btn-secondary {
+  background: var(--bg-soft);
+  color: var(--text);
+  border-color: var(--border);
+}
+.btn-secondary:not(:disabled):hover {
+  background: #30323e;
+}
+
+.status {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.status-label {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.status-text {
+  margin: 4px 0 0;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.status-text.ok { color: var(--ok); }
+.status-text.warn { color: var(--warn); }
+.status-text.err { color: var(--err); }

@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Local AI Translator",
+  "version": "0.1.0",
+  "description": "使用本机 Ollama 模型将英文网页翻译为中文（原文保留，双语显示）。所有推理均在本机进行。",
+  "permissions": [
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:11434/*",
+    "http://localhost:11434/*"
+  ],
+  "action": {
+    "default_title": "Local AI Translator",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
