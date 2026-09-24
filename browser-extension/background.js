@@ -79,10 +79,10 @@ async function checkConnection() {
   }
 
   const models = Array.isArray(tagsData.models) ? tagsData.models : [];
-  const names = models.map((m) => m.name || m.model || "");
-  // 精确匹配，或忽略 tag（qwen3.5:9b ≈ qwen3.5:latest 之外的同一模型名）
-  const found = names.some(
-    (n) => n === CFG.model || n.split(":")[0] === CFG.model.split(":")[0]
+  // Ollama tags may expose the full model name as either `name` or `model`.
+  // Keep the configured tag intact so another size/tag cannot satisfy the check.
+  const found = models.some(
+    (model) => model && (model.name === CFG.model || model.model === CFG.model)
   );
 
   if (found) {

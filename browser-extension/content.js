@@ -801,7 +801,7 @@
     if (!msg || !msg.type) return false;
 
     if (msg.type === "PING") {
-      sendResponse({ ok: true, version: "0.2.1" });
+      sendResponse({ ok: true, version: "0.2.2" });
       return false;
     }
     if (msg.type === "TRANSLATE_PAGE") {

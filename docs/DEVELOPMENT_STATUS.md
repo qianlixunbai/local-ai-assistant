@@ -1,5 +1,12 @@
 # Development Status
 
+## 版本状态（v0.2.2）
+
+**Result: GO** —— 公开前准确性修复：文档说明初始翻译、动态新增内容补翻和 watcher 生命周期；
+Ollama 模型检测改为按配置的完整模型名匹配，不再把 `qwen3.5:9b` 误判为 `qwen3.5:4b`。
+无翻译流程或模型参数变更。原有五组 173 checks 保持通过，新增模型检测 4 checks，
+`npm test` 共 177 checks。v0.2.1 的真实 Chrome 验收记录保留如下。
+
 ## 版本状态（v0.2.1）
 
 **Result: GO** —— v0.2.1 为稳定性 hotfix（P1-1 / P1-2 / P2）。
@@ -15,7 +22,7 @@ v0.2.1 真实 Chrome 人工验收（通过）：
   DOM 译文仍在、watcher 丢失；再次点击 Translate 恢复监听，不重译、不删旧译文
 - 初始页面翻译 / Restore / 动态新增内容 / 关闭 popup 不中断翻译 等既有行为回归正常
 
-v0.2.1 automated regression suite is reproducible from repository.
+v0.2.1 的原有五组自动化回归测试仍可从仓库复现。
 测试脚本位于 `test/`，仅依赖 `jsdom`（devDependency）。新机器执行：
 
 ```bash
@@ -23,7 +30,8 @@ npm ci
 npm test
 ```
 
-即可离线复现全部 173 checks（不依赖本机 Chrome / Ollama / 临时目录 / 绝对路径）。
+当前可离线运行 177 checks，其中 v0.2.1 原有五组为 173 checks，
+v0.2.2 模型检测新增 4 checks（不依赖本机 Chrome / Ollama / 临时目录 / 绝对路径）。
 `package.json` 仅供开发 / 测试，浏览器扩展仍是原生 HTML/CSS/JS，无构建步骤、
 无运行时 npm 依赖。
 
@@ -79,7 +87,7 @@ Reviewer 发现上一版 P2 存在两个边界问题，本轮修复：
   用户再次点击 Translate 时清空该集合，显式重试。`pruneCatchupSkip()` 会在每轮结束时
   剪除已成功 / 已断开的 anchor，并由剩余集合推导 `partial`，避免「后续成功轮次误清 partial」
 
-## 当前实际配置（v0.2.1）
+## 当前实际配置（v0.2.2）
 
 以 `browser-extension/config.js` 为事实来源（**本文件数值与其保持同步**）：
 
@@ -215,10 +223,11 @@ content.js ─┘                                （唯一访问 Ollama 的地�
 
 ## 已知限制
 
-- 当前只处理**用户点击时刻已存在**的 DOM
-- **v0.2.0 起支持动态新增 DOM 的增量翻译**：用户主动点击「翻译当前页面」后，
-  插件通过 `MutationObserver`（`childList + subtree`）监听新增内容，
-  debounce 750ms 后仅收集**尚未翻译**的新 record 并增量翻译；已翻译内容不会重发。
+- 初始翻译在用户点击「翻译当前页面」时收集当前页面内容；首轮翻译处理完成后开启
+  watcher，并立即进行 catch-up 扫描，补翻首轮处理期间新增的 DOM。之后，
+  `MutationObserver`（`childList + subtree`）自动检测动态新增内容；debounce 750ms 后
+  仅收集**尚未翻译**的新 record 并增量翻译，已翻译内容不会重发。`Load More Jobs`、
+  无限滚动及 SPA 局部更新均可触发增量翻译。Restore 会停止 watcher；再次点击翻译可重新开启。
   限制：
   - 页面完整 reload / 整站跳转后 content script 重新加载，需**重新点击翻译**
   - 不做 URL / history router hook（不 monkey patch `pushState` / `popstate`）
