@@ -10,6 +10,13 @@
     // 使用的本地模型
     model: "qwen3.5:4b",
 
+    // 当前固定目标语言（与 background.js 中的固定翻译规则保持一致）。
+    targetLanguage: "Simplified Chinese (zh-CN)",
+    // 若 background.js 的 system prompt / 翻译规则改变，必须同步提升此版本。
+    translationPromptVersion: "v1",
+    // content script 页面生命周期内缓存的最大条目数。
+    translationCacheMaxEntries: 500,
+
     // 关闭 thinking / reasoning。翻译任务不需要推理链。
     think: false,
 

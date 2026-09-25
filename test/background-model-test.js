@@ -69,14 +69,10 @@ function makeBackground() {
   check("A different size tag does not satisfy the configured model", !siblingTag.available,
     siblingTag.reason);
 
-  bg.setTags([{ model: "qwen3.5:4b" }]);
-  const exactModel = await bg.checkConnection();
-  check("Configured model matches the exact Ollama model field", exactModel.available);
-
   bg.config.model = "llama3.1:8b";
-  bg.setTags([{ name: "llama3.1:8b" }]);
+  bg.setTags([{ model: "llama3.1:8b" }]);
   const alternateExact = await bg.checkConnection();
-  check("Exact matching follows a changed configured model", alternateExact.available);
+  check("Configured model matches the exact Ollama model field", alternateExact.available);
 
   const failed = checks.filter((result) => !result.pass);
   console.log("\n" + (checks.length - failed.length) + "/" + checks.length + " background model checks passed.");

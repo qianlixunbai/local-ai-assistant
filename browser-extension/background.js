@@ -176,7 +176,7 @@ async function translateBatch(items) {
       signal: controller.signal
     });
   } catch (e) {
-    console.error("[LAT] /api/chat 请求失败:", e);
+    console.error("[LAT] /api/chat 请求失败:", e && e.name ? e.name : "network");
     if (e && e.name === "AbortError") {
       throw latError("timeout", "Ollama 请求超时（超过 " + Math.round(CFG.requestTimeoutMs / 1000) + " 秒）。");
     }
@@ -223,7 +223,7 @@ async function translateBatch(items) {
   try {
     results = parseTranslationJSON(content);
   } catch (e) {
-    console.error("[LAT] JSON 解析失败，模型原始输出：\n" + content.slice(0, 1000));
+    console.error("[LAT] JSON 解析失败，响应长度:", content.length);
     throw latError("parse", e.message);
   }
 
@@ -365,7 +365,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   handlers[msg.type](msg, sender)
     .then((data) => sendResponse({ ok: true, ...data }))
     .catch((e) => {
-      console.error("[LAT] 处理 " + msg.type + " 失败:", e);
+      console.error("[LAT] 处理 " + msg.type + " 失败:", e && e.kind ? e.kind : "error");
       sendResponse({
         ok: false,
         error: e && e.message ? e.message : String(e),

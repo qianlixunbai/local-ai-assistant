@@ -1,15 +1,11 @@
 {
   "name": "local-ai-assistant",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "private": true,
   "description": "Dev/test tooling only. The browser extension itself is plain HTML/CSS/JS with no build step and no runtime npm dependencies.",
   "scripts": {
-    "test": "npm run test:race && npm run test:dynamic && npm run test:footer && npm run test:viewport && npm run test:state && npm run test:background-model",
-    "test:race": "node test/race-test.js",
-    "test:dynamic": "node test/dynamic-test.js",
-    "test:footer": "node test/footer-test.js",
-    "test:viewport": "node test/viewport-test.js",
-    "test:state": "node test/state-test.js",
+    "test": "npm run test:behavior && npm run test:background-model",
+    "test:behavior": "node test/behavior-test.js",
     "test:background-model": "node test/background-model-test.js"
   },
   "devDependencies": {

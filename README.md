@@ -5,7 +5,7 @@
 
 ## 当前状态
 
-**Browser Translator v0.2.2**
+**Browser Translator v0.3.0 — GO**
 
 一个 Chrome / Chromium 浏览器扩展（Manifest V3），用于将英文网页正文
 翻译为中文。原文保留，中文译文显示在原文下方，可一键恢复原文。
@@ -18,6 +18,8 @@
 - **v0.2.1**：稳定性修复（初始翻译窗口内新增 DOM 补翻、会话 generation 隔离、
   重复点击 Translate 幂等），无新功能。
 - **v0.2.2**：公开前准确性修复（动态内容文档说明、模型完整名称检测），无新功能。
+- **v0.3.0**：同一批次重复文本只请求一次模型，并在当前页面生命周期内复用成功译文。
+  Restore 和 `LAT_RESET` 会清除页面译文及当前会话，但保留内存缓存；完整页面刷新后缓存消失。
 
 > 范围仍限定为「浏览器本地 AI 翻译插件」。
 > 桌面助手 / RAG / Tool Calling / Vision / 截图翻译等均为后续阶段。
@@ -72,7 +74,7 @@
 5. 英文原文保留，原文下方出现自然中文译文（当前屏幕内容优先）
 6. 若首轮翻译全部成功，状态变为 **翻译完成 · 正在监听新内容**；页面新加载的内容
    （如 `Load More Jobs`、无限滚动 / SPA 局部更新）会自动增量翻译，无需再次点击
-7. 点击 **恢复原文** 移除全部译文并停止监听
+7. 点击 **恢复原文** 移除全部译文并停止监听。再次翻译时，本页已有的成功译文可直接复用
 
 > 页面完整刷新或整站跳转后，需重新点击 **翻译当前页面**。
 
@@ -87,15 +89,10 @@ npm ci
 npm test
 ```
 
-`npm test` 顺序执行完整测试集（Race 33 / Dynamic 35 / Footer 34 / Viewport 26 /
-State 45 / Background Model 4，共 177 checks）。也可单独运行：
+`npm test` 顺序执行综合行为测试与精确模型检测测试。也可单独运行：
 
 ```bash
-npm run test:race
-npm run test:dynamic
-npm run test:footer
-npm run test:viewport
-npm run test:state
+npm run test:behavior
 npm run test:background-model
 ```
 
@@ -107,7 +104,8 @@ npm run test:background-model
 
 - **所有 AI 推理都在本机 Ollama 中进行**，不向任何云服务发送网页内容。
 - 不包含 analytics / telemetry / 第三方 CDN / 远程脚本。
-- 不持久化存储网页正文，翻译内容仅在内存中处理。
+- 不持久化存储网页正文。v0.3.0 的成功译文缓存仅保存在当前页面的 content script 内存中，
+  不跨页面、标签页或浏览器重启共享。
 
 ## 目录结构
 
@@ -126,12 +124,8 @@ local-ai-assistant/
 │  └─ DEVELOPMENT_STATUS.md
 ├─ test/
 │  ├─ dynamic-test-page.html   动态内容手动测试页（Load More 追加 10 张卡片）
-│  ├─ race-test.js             会话竞态 / generation 隔离
-│  ├─ dynamic-test.js          动态内容增量翻译
-│  ├─ footer-test.js           页脚提取与过滤
-│  ├─ viewport-test.js         Viewport First 优先级
-│  ├─ state-test.js            partial / watching 状态机
-│  └─ background-model-test.js 模型完整名称检测
+│  ├─ behavior-test.js         翻译、动态内容、竞态与缓存行为
+│  └─ background-model-test.js 精确模型名称检测
 ├─ package.json                测试脚本 + jsdom（devDependencies，仅供开发）
 ├─ .gitignore
 └─ README.md

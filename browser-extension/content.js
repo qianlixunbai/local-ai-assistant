@@ -57,6 +57,8 @@
   let session = null;
   let sessionProgress = { status: "idle", done: 0, total: 0 };
   let lastError = "";
+  // 页面级缓存独立于翻译 session；Restore / LAT_RESET 不清除此 Map。
+  const translationCache = new Map();
   // 会话 generation：Restore / LAT_RESET / 每次新翻译都会递增。
   // 所有 async 翻译循环在 await 之后必须核对自己的 generation，
   // 不匹配即视为 stale，丢弃结果且不得修改任何会话状态（见 v0.2.1 P1-2）。
@@ -321,6 +323,102 @@
     return byId;
   }
 
+  /** 精确翻译缓存 key；keep_alive 与 DOM / session 信息不影响翻译结果。 */
+  function translationCacheKey(text) {
+    return JSON.stringify({
+      text: normalize(text),
+      model: CFG.model,
+      targetLanguage: CFG.targetLanguage,
+      promptVersion: CFG.translationPromptVersion,
+      think: CFG.think,
+      temperature: CFG.temperature,
+      topP: CFG.top_p,
+      numPredict: CFG.num_predict,
+      numCtx: CFG.num_ctx
+    });
+  }
+
+  /** Cache hit 时提升为最近使用项。 */
+  function getCachedTranslation(key) {
+    if (!translationCache.has(key)) return null;
+    const value = translationCache.get(key);
+    translationCache.delete(key);
+    translationCache.set(key, value);
+    return value;
+  }
+
+  /** 只保存成功的非空译文，并按最近使用顺序限制页面缓存容量。 */
+  function setCachedTranslation(key, translation) {
+    if (typeof translation !== "string" || !translation.trim()) return;
+    translationCache.delete(key);
+    translationCache.set(key, translation.trim());
+    while (translationCache.size > CFG.translationCacheMaxEntries) {
+      const oldestKey = translationCache.keys().next().value;
+      translationCache.delete(oldestKey);
+    }
+  }
+
+  /**
+   * 先查页面缓存，再将未命中的相同 key 合并为唯一请求项。
+   * cachePlan.byId 仅包含当前 batch 的 cache hit；missGroups 用于回填和 fan-out。
+   */
+  function prepareCachedBatch(batch) {
+    const byId = new Map();
+    const missGroups = new Map();
+    let hits = 0;
+    let misses = 0;
+
+    batch.forEach((record) => {
+      const key = translationCacheKey(record.text);
+      const cached = getCachedTranslation(key);
+      if (cached !== null) {
+        byId.set(record.id, cached);
+        hits++;
+        return;
+      }
+
+      misses++;
+      let group = missGroups.get(key);
+      if (!group) {
+        group = { key, records: [] };
+        missGroups.set(key, group);
+      }
+      group.records.push(record);
+    });
+
+    const requests = Array.from(missGroups.values(), (group) => group.records[0]);
+    console.log(
+      TAG + " cache: hits=" + hits +
+      " misses=" + misses +
+      " deduped=" + (misses - requests.length) +
+      " requests=" + requests.length
+    );
+    return { byId, missGroups, requests };
+  }
+
+  /**
+   * 成功响应只在调用方完成 post-await generation 校验后传入此处，
+   * 再写缓存并把 unique response 映射回所有原 record id。
+   */
+  function resolveCachedBatch(cachePlan, translatedById, generation) {
+    if (!isCurrentSession(generation)) return null;
+    const byId = cachePlan.byId;
+
+    for (const group of cachePlan.missGroups.values()) {
+      const representative = group.records[0];
+      const translation = translatedById && translatedById.get(representative.id);
+      if (typeof translation !== "string" || !translation.trim()) continue;
+
+      const normalizedTranslation = translation.trim();
+      // generation 校验必须位于任何 cache write 之前。
+      if (!isCurrentSession(generation)) return null;
+      setCachedTranslation(group.key, normalizedTranslation);
+      group.records.forEach((record) => byId.set(record.id, normalizedTranslation));
+    }
+
+    return byId;
+  }
+
   /* ------------------------------------------------------------------ */
   /* 插入译文                                                            */
   /* ------------------------------------------------------------------ */
@@ -483,7 +581,7 @@
 
       const batch = batches[i].filter((r) => {
         if (r.text.length > CFG.hardTextLimit) {
-          console.warn(TAG, "跳过超长文本（" + r.text.length + " 字符）:", r.text.slice(0, 80) + "…");
+          console.warn(TAG, "跳过超长文本（" + r.text.length + " 字符）");
           return false;
         }
         return true;
@@ -492,12 +590,23 @@
 
       batch.forEach((r) => r.anchor.classList.add("local-ai-translating"));
       try {
-        const byId = await requestBatch(batch);
+        const cachePlan = prepareCachedBatch(batch);
+        let translatedById = null;
+        let requestError = null;
+        if (cachePlan.requests.length) {
+          try {
+            translatedById = await requestBatch(cachePlan.requests);
+          } catch (e) {
+            requestError = e;
+          }
+        }
         // stale：丢弃结果，不插入、不改 session / progress
         if (!isCurrentSession(myGen) || !watching) {
-          batch.forEach((r) => r.anchor.classList.remove("local-ai-translating"));
           break;
         }
+        const byId = resolveCachedBatch(cachePlan, translatedById, myGen);
+        if (!byId) break;
+        if (requestError) console.error(TAG, "动态批次翻译失败:", requestError.name || "error");
         batch.forEach((r) => {
           const translation = byId.get(r.id);
           if (typeof translation === "string" && translation.trim()) {
@@ -511,7 +620,7 @@
           r.anchor.classList.remove("local-ai-translating");
         });
       } catch (e) {
-        console.error(TAG, "动态批次翻译失败:", e);
+        console.error(TAG, "动态批次翻译失败:", e && e.name ? e.name : "error");
         failed += batch.length;
         batch.forEach((r) => { failedAnchors.push(r.anchor); r.anchor.classList.remove("local-ai-translating"); });
       }
@@ -623,7 +732,7 @@
       const usable = [];
       batch.forEach((r) => {
         if (r.text.length > CFG.hardTextLimit) {
-          console.warn(TAG, "跳过超长文本（" + r.text.length + " 字符）:", r.text.slice(0, 80) + "…");
+          console.warn(TAG, "跳过超长文本（" + r.text.length + " 字符）");
           skipped++;
         } else {
           usable.push(r);
@@ -640,11 +749,25 @@
       const batchChars = usable.reduce((s, r) => s + r.text.length, 0);
       const bt0 = performance.now();
       try {
-        const byId = await requestBatch(usable);
+        const cachePlan = prepareCachedBatch(usable);
+        let translatedById = null;
+        let requestError = null;
+        if (cachePlan.requests.length) {
+          try {
+            translatedById = await requestBatch(cachePlan.requests);
+          } catch (e) {
+            requestError = e;
+          }
+        }
         // stale（Restore / 新会话已开始）：丢弃结果，不插图、不写状态，立即退出
         if (!isCurrentSession(myGen)) {
-          usable.forEach((r) => r.anchor.classList.remove("local-ai-translating"));
           return { ok: false, stale: true, cancelled: true };
+        }
+        const byId = resolveCachedBatch(cachePlan, translatedById, myGen);
+        if (!byId) return { ok: false, stale: true, cancelled: true };
+        if (requestError) {
+          console.error(TAG, "批次翻译失败:", requestError.name || "error");
+          lastError = requestError && requestError.message ? requestError.message : String(requestError);
         }
         usable.forEach((r) => {
           const translation = byId.get(r.id);
@@ -660,10 +783,9 @@
         });
       } catch (e) {
         if (!isCurrentSession(myGen)) {
-          usable.forEach((r) => r.anchor.classList.remove("local-ai-translating"));
           return { ok: false, stale: true, cancelled: true };
         }
-        console.error(TAG, "批次翻译失败:", e);
+        console.error(TAG, "批次翻译失败:", e && e.name ? e.name : "error");
         lastError = e && e.message ? e.message : String(e);
         failed += usable.length;
         usable.forEach((r) => { failedAnchors.push(r.anchor); r.anchor.classList.remove("local-ai-translating"); });
@@ -801,7 +923,7 @@
     if (!msg || !msg.type) return false;
 
     if (msg.type === "PING") {
-      sendResponse({ ok: true, version: "0.2.2" });
+      sendResponse({ ok: true, version: "0.3.0" });
       return false;
     }
     if (msg.type === "TRANSLATE_PAGE") {

@@ -1,5 +1,35 @@
 # Development Status
 
+## Testing Policy
+
+Minimal High-Value Testing：优先用少量完整行为场景覆盖真实用户流程与高风险竞态。
+避免测试实现细节及重复的历史回归；一个场景可以包含多个必要断言。
+新增测试须有明确回归价值，测试数量和覆盖率百分比不是项目目标。
+
+## 版本状态（v0.3.0）
+
+**Result: GO** —— Translation Cache 与测试精简已完成。`npm ci`、`npm test`、
+`git diff --check` 通过；当前测试包含 10 个综合行为场景和 3 个精确模型检测检查，
+覆盖翻译、DOM 提取、动态内容、竞态和缓存边界。
+
+本轮仅增加当前页面 content script 生命周期内的内存译文缓存与同批重复文本合并。
+缓存与 translation session 分离：Translate 可读取和写入；Restore / `LAT_RESET` 清除译文、
+结束会话但保留缓存；页面完整刷新会重建 content script，缓存自然消失。
+首次翻译、后续批次和动态内容共用缓存解析逻辑。只缓存当前 generation 的非空成功译文，
+失败、缺失 ID、超长跳过项和过期响应均不写入。缓存上限为 500 条，最近使用的条目保留；
+该上限可覆盖常见页面的大量重复短语，同时限制单页内存增长。
+
+缓存 key 精确包含规范化原文、模型、目标语言、翻译规则版本及会影响输出的生成参数。
+如修改 `background.js` 的翻译 system prompt 或翻译规则，须同步提升
+`config.js` 的 `translationPromptVersion`。当前翻译 prompt 与模型参数保持原样。
+
+用户已在真实 Chrome + SEEK 页面确认：正文、长文本、列表及 Footer 的翻译显示正常，
+原文保留，页面结构未明显破坏；Translate → Restore → 再 Translate 的第二次译文恢复近乎即时。
+动态缓存命中及请求中的竞态由自动测试覆盖，本轮没有对应的人工验收记录。
+公开发布审计移除了 Console 中的网页正文片段和模型原始回复输出，保留非敏感的长度与错误类型。
+
+已知限制：相同原文在不同语境中可能需要不同译法；当前缓存按精确文本与翻译配置复用。
+
 ## 版本状态（v0.2.2）
 
 **Result: GO** —— 公开前准确性修复：文档说明初始翻译、动态新增内容补翻和 watcher 生命周期；
@@ -22,7 +52,7 @@ v0.2.1 真实 Chrome 人工验收（通过）：
   DOM 译文仍在、watcher 丢失；再次点击 Translate 恢复监听，不重译、不删旧译文
 - 初始页面翻译 / Restore / 动态新增内容 / 关闭 popup 不中断翻译 等既有行为回归正常
 
-v0.2.1 的原有五组自动化回归测试仍可从仓库复现。
+v0.2.1 当时的五组自动化回归测试已在 v0.3.0 合并为综合行为测试。
 测试脚本位于 `test/`，仅依赖 `jsdom`（devDependency）。新机器执行：
 
 ```bash
@@ -30,8 +60,8 @@ npm ci
 npm test
 ```
 
-当前可离线运行 177 checks，其中 v0.2.1 原有五组为 173 checks，
-v0.2.2 模型检测新增 4 checks（不依赖本机 Chrome / Ollama / 临时目录 / 绝对路径）。
+历史 v0.2.2 测试结果为 177 checks，其中 v0.2.1 五组为 173 checks，
+v0.2.2 模型检测增加 4 checks。v0.3.0 的当前测试套件已精简。
 `package.json` 仅供开发 / 测试，浏览器扩展仍是原生 HTML/CSS/JS，无构建步骤、
 无运行时 npm 依赖。
 
@@ -87,7 +117,7 @@ Reviewer 发现上一版 P2 存在两个边界问题，本轮修复：
   用户再次点击 Translate 时清空该集合，显式重试。`pruneCatchupSkip()` 会在每轮结束时
   剪除已成功 / 已断开的 anchor，并由剩余集合推导 `partial`，避免「后续成功轮次误清 partial」
 
-## 当前实际配置（v0.2.2）
+## 当前实际配置（v0.3.0）
 
 以 `browser-extension/config.js` 为事实来源（**本文件数值与其保持同步**）：
 
@@ -104,6 +134,9 @@ Reviewer 发现上一版 P2 存在两个边界问题，本轮修复：
 | `keep_alive` | `"30m"` |
 | `dynamicTranslateEnabled` | `true` |
 | `mutationDebounceMs` | `750` |
+| `targetLanguage` | `Simplified Chinese (zh-CN)` |
+| `translationPromptVersion` | `v1` |
+| `translationCacheMaxEntries` | `500` |
 
 ## 模型选择说明
 
