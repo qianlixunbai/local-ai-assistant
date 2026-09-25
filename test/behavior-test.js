@@ -532,6 +532,155 @@ async function scenario(name, run) {
     lruEnv.dom.window.close();
   });
 
+  await scenario("selection card shares page cache with full-page translation and stays outside DOM collection", async () => {
+    const selected = "Senior Software Engineer";
+    const env = makeEnv(pageWithTexts([selected, "Other useful page content"]));
+    const source = env.document.querySelector("#main p");
+    const initialHtml = source.innerHTML;
+
+    await env.send({ type: "TRANSLATE_SELECTION", selectionText: "  " + selected + "  " });
+    assert.deepStrictEqual(env.sentTexts(), [selected]);
+    assert.strictEqual(env.document.querySelectorAll(".local-ai-selection-card").length, 1);
+    assert(env.document.querySelector(".local-ai-selection-card").textContent.includes("【译】" + selected));
+    assert.strictEqual(source.innerHTML, initialHtml, "selection translation leaves source text alone");
+
+    const beforeRepeat = env.requests.length;
+    await env.send({ type: "TRANSLATE_SELECTION", selectionText: selected });
+    assert.strictEqual(env.requests.length, beforeRepeat, "repeat selection is served from the shared cache");
+    assert.strictEqual(env.document.querySelectorAll(".local-ai-selection-card").length, 1, "card is reused");
+
+    await env.translate();
+    assert.deepStrictEqual(env.sentTexts(), [selected, "Other useful page content"],
+      "full-page translation reuses selection cache and never sends card text");
+    await wait(DEBOUNCE + 100);
+    assert.strictEqual(env.requests.length, 2, "card insertion and update do not trigger dynamic requests");
+    await env.restore();
+    assert.strictEqual(env.document.querySelectorAll(".local-ai-selection-card").length, 1,
+      "Restore leaves the independent selection card open");
+    env.document.querySelector(".local-ai-selection-card button").click();
+    assert.strictEqual(env.document.querySelectorAll(".local-ai-selection-card").length, 0);
+    env.dom.window.close();
+
+    const reverse = makeEnv(pageWithTexts([selected]));
+    await reverse.translate();
+    const orphan = reverse.document.createElement("section");
+    orphan.className = "local-ai-selection-card";
+    orphan.textContent = "Old card from a previous content-script context";
+    reverse.document.body.appendChild(orphan);
+    const beforeSelectionHit = reverse.requests.length;
+    await reverse.send({ type: "TRANSLATE_SELECTION", selectionText: selected });
+    assert.strictEqual(reverse.requests.length, beforeSelectionHit, "selection reuses prior full-page result");
+    assert.strictEqual(reverse.document.querySelectorAll(".local-ai-selection-card").length, 1,
+      "a card left by a previous content-script context is replaced");
+    assert(reverse.document.querySelector(".local-ai-selection-card").textContent.includes("【译】" + selected));
+    reverse.dom.window.close();
+  });
+
+  await scenario("new selection wins a late response and stale output stays uncached", async () => {
+    const env = makeEnv(pageWithTexts(["Unrelated page body"]), { autoRespond: false, dynamic: false });
+    const first = env.send({ type: "TRANSLATE_SELECTION", selectionText: "Alpha selection text" });
+    assert(await pollUntil(() => env.pending.length === 1));
+    const stale = env.pending[0];
+    const second = env.send({ type: "TRANSLATE_SELECTION", selectionText: "Bravo selection text" });
+    assert(await pollUntil(() => env.pending.length === 2));
+    const current = env.pending.find((request) => request !== stale);
+    env.resolveRequest(current, "CURRENT");
+    await second;
+    env.resolveRequest(stale, "STALE");
+    await first;
+    assert(env.document.querySelector(".local-ai-selection-card").textContent.includes("【CURRENT】Bravo selection text"));
+    assert(!env.document.querySelector(".local-ai-selection-card").textContent.includes("Alpha selection text"));
+    const retry = env.send({ type: "TRANSLATE_SELECTION", selectionText: "Alpha selection text" });
+    assert(await pollUntil(() => env.pending.length === 1), "stale selection did not populate cache");
+    env.resolveRequest(env.pending[0], "RETRY");
+    await retry;
+    assert(env.document.querySelector(".local-ai-selection-card").textContent.includes("【RETRY】Alpha selection text"));
+
+    const closing = env.send({ type: "TRANSLATE_SELECTION", selectionText: "Closing pending text" });
+    assert(await pollUntil(() => env.pending.length === 1));
+    env.document.querySelector(".local-ai-selection-card button").click();
+    env.resolveRequest(env.pending[0], "LATE");
+    await closing;
+    assert.strictEqual(env.document.querySelectorAll(".local-ai-selection-card").length, 0,
+      "closing the card invalidates its in-flight request");
+    const afterClose = env.send({ type: "TRANSLATE_SELECTION", selectionText: "Closing pending text" });
+    assert(await pollUntil(() => env.pending.length === 1), "response after close was not cached");
+    env.resolveRequest(env.pending[0], "NEW");
+    await afterClose;
+    env.dom.window.close();
+  });
+
+  await scenario("selection rejects overlong text and shows safe model errors", async () => {
+    const env = makeEnv(pageWithTexts(["Ordinary page text"]), {
+      dynamic: false,
+      config: { hardTextLimit: 20 }
+    });
+    await env.send({ type: "TRANSLATE_SELECTION", selectionText: "This selection is far too long" });
+    assert.strictEqual(env.requests.length, 0, "overlong selection never reaches the model");
+    assert(env.document.querySelector(".local-ai-selection-card").textContent.includes("过长"));
+
+    env.setResponseFor(() => ({ ok: false, kind: "model", error: "raw secret model response" }));
+    await env.send({ type: "TRANSLATE_SELECTION", selectionText: "Model error text" });
+    const cardText = env.document.querySelector(".local-ai-selection-card").textContent;
+    assert(cardText.includes("本地模型不可用"));
+    assert(!cardText.includes("raw secret") && !cardText.includes("Model error text"));
+    assert(!env.logs.join(" ").includes("Model error text"), "logs never include selection text");
+    env.dom.window.close();
+  });
+
+  await scenario("BR-separated article text stays segmented, adjacent, dynamic, and restorable", async () => {
+    const paragraphs = [
+      "First normal English paragraph.",
+      "Second normal English paragraph.",
+      "SECTION TITLE",
+      "Third normal English paragraph."
+    ];
+    const env = makeEnv('<!doctype html><html><body><div id="article">' +
+      paragraphs[0] + '<br>' + paragraphs[1] + '<br><strong>' + paragraphs[2] +
+      '</strong><br>' + paragraphs[3] + '</div><div id="feed"></div></body></html>');
+    const article = env.document.getElementById("article");
+    await env.send({ type: "TRANSLATE_SELECTION", selectionText: "Manual selection only" });
+    const beforePage = env.requests.length;
+    const sourceNodes = [
+      article.firstChild,
+      article.childNodes[2],
+      article.querySelector("strong"),
+      article.lastChild
+    ];
+    env.setAutoRespond(false);
+    const pageRun = env.translate();
+    assert(await pollUntil(() => env.pending.length === 1));
+    // A page can move a BR while Ollama is answering. The saved source node
+    // still defines where its translation must appear.
+    article.insertBefore(sourceNodes[1].nextSibling, sourceNodes[1]);
+    const originalHtml = article.innerHTML;
+    env.resolveRequest(env.pending[0], "译");
+    await pageRun;
+    env.setAutoRespond(true);
+
+    const pageTexts = env.requests.slice(beforePage).flatMap((request) => env.requestTexts(request));
+    assert.deepStrictEqual(pageTexts, paragraphs, "each visual line is sent once and card text is excluded");
+    const translated = [...article.querySelectorAll(".local-ai-translation")];
+    assert.strictEqual(translated.length, paragraphs.length);
+    translated.forEach((node, index) => {
+      assert.strictEqual(node.textContent, "【译】" + paragraphs[index]);
+      assert(sourceNodes[index].compareDocumentPosition(node) & env.window.Node.DOCUMENT_POSITION_FOLLOWING,
+        "each translation follows its own English source in DOM order");
+    });
+
+    article.append(env.document.createElement("br"), env.document.createTextNode("Fourth dynamic English paragraph."));
+    assert(await pollUntil(() => env.translations().length === 5), "dynamic BR segment is translated");
+    assert.deepStrictEqual(env.sentTexts().filter((text) => text === "Fourth dynamic English paragraph."),
+      ["Fourth dynamic English paragraph."]);
+    await env.restore();
+    assert.strictEqual(article.innerHTML, originalHtml + "<br>Fourth dynamic English paragraph.",
+      "Restore removes translations without changing source structure");
+    assert.strictEqual(env.document.querySelectorAll(".local-ai-translation").length, 0);
+    assert.strictEqual(env.document.querySelectorAll("[data-local-ai-source]").length, 0);
+    assert.strictEqual(env.document.querySelectorAll(".local-ai-selection-card").length, 1);
+    env.dom.window.close();
+  });
+
   console.log("\n===== ALL PASS (" + passed.length + " behavior scenarios) =====");
   process.exit(0);
 })().catch((error) => {

@@ -5,7 +5,7 @@
 
 ## 当前状态
 
-**Browser Translator v0.3.0 — GO**
+**Browser Translator v0.4.0 — GO**
 
 一个 Chrome / Chromium 浏览器扩展（Manifest V3），用于将英文网页正文
 翻译为中文。原文保留，中文译文显示在原文下方，可一键恢复原文。
@@ -20,6 +20,9 @@
 - **v0.2.2**：公开前准确性修复（动态内容文档说明、模型完整名称检测），无新功能。
 - **v0.3.0**：同一批次重复文本只请求一次模型，并在当前页面生命周期内复用成功译文。
   Restore 和 `LAT_RESET` 会清除页面译文及当前会话，但保留内存缓存；完整页面刷新后缓存消失。
+- **v0.4.0 Selection / Context Menu Translation**：选中英文文本 → 右键点击
+  **使用 Local AI 翻译选中文本** → 在页面浮层查看中文译文。不会改动原网页文本，
+  并与整页翻译共享当前页面的内存缓存。整页翻译也改进了以 `<br>` 排版的正文兼容性。
 
 > 范围仍限定为「浏览器本地 AI 翻译插件」。
 > 桌面助手 / RAG / Tool Calling / Vision / 截图翻译等均为后续阶段。
@@ -75,6 +78,7 @@
 6. 若首轮翻译全部成功，状态变为 **翻译完成 · 正在监听新内容**；页面新加载的内容
    （如 `Load More Jobs`、无限滚动 / SPA 局部更新）会自动增量翻译，无需再次点击
 7. 点击 **恢复原文** 移除全部译文并停止监听。再次翻译时，本页已有的成功译文可直接复用
+8. 也可在网页中选中英文文本，右键点击 **使用 Local AI 翻译选中文本**，在选区附近的浮层查看译文；点击 × 关闭
 
 > 页面完整刷新或整站跳转后，需重新点击 **翻译当前页面**。
 
@@ -106,6 +110,7 @@ npm run test:background-model
 - 不包含 analytics / telemetry / 第三方 CDN / 远程脚本。
 - 不持久化存储网页正文。v0.3.0 的成功译文缓存仅保存在当前页面的 content script 内存中，
   不跨页面、标签页或浏览器重启共享。
+- 划词译文使用同一页面内存缓存；不保存选中历史，也不读取或写入剪贴板。
 
 ## 目录结构
 
@@ -115,8 +120,8 @@ local-ai-assistant/
 │  ├─ manifest.json
 │  ├─ config.js           集中配置（Ollama 地址 / 模型名 / 批次参数）
 │  ├─ background.js       service worker：注入 content script
-│  ├─ content.js          正文提取 / 批量翻译 / 双语插入 / 恢复 / 动态内容监听
-│  ├─ content.css         译文样式（仅作用于 .local-ai-translation）
+│  ├─ content.js          正文翻译 / 动态监听 / 选中文本翻译与浮层
+│  ├─ content.css         正文译文与选区浮层样式
 │  ├─ popup.html
 │  ├─ popup.css
 │  └─ popup.js            popup 逻辑与 Ollama 连接检测

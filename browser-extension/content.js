@@ -53,12 +53,18 @@
     "embed", "template", "head", "title"
   ].join(",");
   const PRUNE_SELECTOR = (CFG.pruneSelectors || []).join(",");
+  const SELECTION_CARD_SELECTOR = ".local-ai-selection-card";
+  const LINE_TRANSLATION_ATTR = "data-local-ai-line-translation";
 
   let session = null;
   let sessionProgress = { status: "idle", done: 0, total: 0 };
   let lastError = "";
   // 页面级缓存独立于翻译 session；Restore / LAT_RESET 不清除此 Map。
   const translationCache = new Map();
+  // 选区翻译使用独立 generation，不改变整页翻译 session 的生命周期。
+  let selectionGeneration = 0;
+  let selectionCard = null;
+  let contextMenuSelection = null;
   // 会话 generation：Restore / LAT_RESET / 每次新翻译都会递增。
   // 所有 async 翻译循环在 await 之后必须核对自己的 generation，
   // 不匹配即视为 stale，丢弃结果且不得修改任何会话状态（见 v0.2.1 P1-2）。
@@ -84,6 +90,8 @@
   // observer / catch-up 不得重试它们，否则失败 record 会陷入无限重试循环。
   // 用户再次点击 Translate 时清空（显式重试）。
   let catchupSkipAnchors = new Set();
+  // BR 段落失败时以该段首个原始 DOM 节点为稳定 key，不跳过同容器的其他段落。
+  const failedLineKeys = new WeakSet();
 
   /* ------------------------------------------------------------------ */
   /* 文本判定                                                            */
@@ -91,6 +99,12 @@
 
   function normalize(text) {
     return (text || "").replace(/\s+/g, " ").trim();
+  }
+
+  /** 节点是否位于选区翻译卡片内（覆盖卡片本身和所有后代）。 */
+  function isSelectionCardNode(node) {
+    const el = node && (node.nodeType === 1 ? node : node.parentElement);
+    return !!(el && el.closest && el.closest(SELECTION_CARD_SELECTOR));
   }
 
   /** 判断一段可见文本是否值得翻译 */
@@ -161,24 +175,112 @@
   function hasTranslation(anchor) {
     if (anchor.querySelector(":scope > ." + CFG.translationClass)) return true;
     const next = anchor.nextElementSibling;
-    return !!(next && next.classList.contains(CFG.translationClass));
+    return !!(next && next.classList.contains(CFG.translationClass) && !next.hasAttribute(LINE_TRANSLATION_ATTR));
   }
 
   /** 锚点是否仍需要翻译（未断开、无译文、未标记 source）。用于 partial 追踪剪枝。 */
   function anchorStillNeedsWork(anchor) {
+    if (failedLineKeys.has(anchor)) return anchor.isConnected;
     return !!anchor && anchor.isConnected && !hasTranslation(anchor) && !anchor.hasAttribute(CFG.sourceAttr);
   }
 
   /** 剪除已成功 / 已断开的 anchor；剩余集合即「仍然失败、等待显式重试」的 record。 */
   function pruneCatchupSkip() {
     catchupSkipAnchors.forEach((a) => {
-      if (!anchorStillNeedsWork(a)) catchupSkipAnchors.delete(a);
+      if (!anchorStillNeedsWork(a)) {
+        catchupSkipAnchors.delete(a);
+        failedLineKeys.delete(a);
+      }
     });
+  }
+
+  function clearCatchupSkip() {
+    catchupSkipAnchors.forEach((a) => failedLineKeys.delete(a));
+    catchupSkipAnchors.clear();
   }
 
   /* ------------------------------------------------------------------ */
   /* 提取                                                                */
   /* ------------------------------------------------------------------ */
+
+  function hasDirectBreak(el, cache) {
+    if (cache.has(el)) return cache.get(el);
+    for (let child = el.firstElementChild; child; child = child.nextElementSibling) {
+      if (child.tagName === "BR") {
+        cache.set(el, true);
+        return true;
+      }
+    }
+    cache.set(el, false);
+    return false;
+  }
+
+  /** 仅沿行内祖先上溯，找到以直接子级 BR 排版的容器。 */
+  function findBreakContainer(textNode, directBreakCache, nestedBreakCache) {
+    let el = textNode.parentElement;
+    while (el && el.tagName !== "BODY" && el.tagName !== "HTML") {
+      if (hasDirectBreak(el, directBreakCache)) return el;
+      if (!INLINE_TAGS.has(el.tagName)) break;
+      // Inline descendants may themselves contain nested BR markup. Keep their
+      // surrounding text with that inline subtree rather than losing it upstream.
+      if (!nestedBreakCache.has(el)) nestedBreakCache.set(el, !!el.querySelector("br"));
+      if (nestedBreakCache.get(el)) return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  /**
+   * 把 BR 容器的直接子级按换行和块级子元素切段。只读原始 DOM；
+   * 已插入的行译文作为该段完成标记，下一段仍可独立收集。
+   */
+  function indexBreakSegments(container, byTextNode) {
+    let segment = { anchor: container, nodes: [], textNodes: [], pieces: [], translated: false };
+
+    const flush = () => {
+      if (segment.nodes.length) {
+        segment.key = segment.nodes[0];
+        segment.text = normalize(segment.pieces.join(" "));
+        segment.textNodes.forEach((textNode) => byTextNode.set(textNode, segment));
+      }
+      segment = { anchor: container, nodes: [], textNodes: [], pieces: [], translated: false };
+    };
+
+    const gather = (node) => {
+      if (node.nodeType === 3) {
+        segment.textNodes.push(node);
+        const piece = normalize(node.nodeValue);
+        if (piece) segment.pieces.push(piece);
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      if (node.matches(SKIP_SELECTOR) || (PRUNE_SELECTOR && node.matches(PRUNE_SELECTOR)) ||
+          node.matches(SELECTION_CARD_SELECTOR) || node.classList.contains(CFG.translationClass) ||
+          node.hasAttribute(CFG.sourceAttr) ||
+          node.querySelector(":scope > ." + CFG.translationClass) || !isVisible(node)) return;
+      for (let child = node.firstChild; child; child = child.nextSibling) gather(child);
+    };
+
+    for (let child = container.firstChild; child; child = child.nextSibling) {
+      if (child.nodeType === 1) {
+        if (child.classList.contains(CFG.translationClass)) {
+          segment.translated = true;
+          flush();
+          continue;
+        }
+        if (child.tagName === "BR" || !INLINE_TAGS.has(child.tagName) || child.querySelector("br")) {
+          flush();
+          continue;
+        }
+      }
+      if (child.nodeType !== 1 && child.nodeType !== 3) continue;
+      segment.nodes.push(child);
+      const before = segment.pieces.length;
+      gather(child);
+      if (segment.pieces.length > before) segment.afterNode = child;
+    }
+    flush();
+  }
 
   /**
    * 遍历文本节点，聚合成 translation record。
@@ -190,11 +292,19 @@
     const walker = document.createTreeWalker(
       scope,
       NodeFilter.SHOW_TEXT,
-      null
+      {
+        acceptNode(node) {
+          return isSelectionCardNode(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+        }
+      }
     );
 
     const records = [];
     const lastByAnchor = new Map();
+    const breakSegmentsByText = new WeakMap();
+    const indexedBreakContainers = new WeakSet();
+    const directBreakCache = new WeakMap();
+    const nestedBreakCache = new WeakMap();
     let id = 0;
     let node;
 
@@ -203,7 +313,27 @@
       if (!parent) continue;
       if (parent.closest(SKIP_SELECTOR)) continue;
       if (PRUNE_SELECTOR && parent.closest(PRUNE_SELECTOR)) continue;
+      if (parent.closest(SELECTION_CARD_SELECTOR)) continue;
       if (parent.closest("." + CFG.translationClass)) continue;
+
+      const breakContainer = findBreakContainer(node, directBreakCache, nestedBreakCache);
+      if (breakContainer) {
+        // A translated container from an older content-script version remains owned by that version.
+        const next = breakContainer.nextElementSibling;
+        if (breakContainer.hasAttribute(CFG.sourceAttr) ||
+            (next && next.classList.contains(CFG.translationClass) && !next.hasAttribute(LINE_TRANSLATION_ATTR))) continue;
+        if (!indexedBreakContainers.has(breakContainer)) {
+          indexBreakSegments(breakContainer, breakSegmentsByText);
+          indexedBreakContainers.add(breakContainer);
+        }
+        const line = breakSegmentsByText.get(node);
+        if (!line || line.emitted) continue;
+        line.emitted = true;
+        if (line.translated || catchupSkipAnchors.has(line.key) || !isVisible(breakContainer) ||
+            !isTranslatableText(line.text)) continue;
+        records.push({ id: id++, text: line.text, anchor: breakContainer, line, domOrder: records.length });
+        continue;
+      }
 
       const anchor = findAnchor(node);
       if (!anchor || !anchor.parentNode) continue;
@@ -316,7 +446,11 @@
     const resp = await chrome.runtime.sendMessage({ type: "TRANSLATE_BATCH", items });
 
     if (!resp) throw new Error("background 未响应。");
-    if (!resp.ok) throw new Error(resp.error || "翻译请求失败。");
+    if (!resp.ok) {
+      const error = new Error(resp.error || "翻译请求失败。");
+      error.kind = resp.kind;
+      throw error;
+    }
 
     const byId = new Map();
     (resp.results || []).forEach((r) => byId.set(Number(r.id), r.translation));
@@ -420,6 +554,228 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* 选区翻译                                                            */
+  /* ------------------------------------------------------------------ */
+
+  function rectSnapshot(rect) {
+    if (!rect) return null;
+    const left = Number(rect.left);
+    const top = Number(rect.top);
+    const right = Number(rect.right);
+    const bottom = Number(rect.bottom);
+    if (![left, top, right, bottom].every(Number.isFinite)) return null;
+    if (right <= left || bottom <= top) return null;
+    return { left, top, right, bottom };
+  }
+
+  function readSelectionGeometry(selection) {
+    if (!selection || selection.isCollapsed || !selection.rangeCount) return null;
+    try {
+      const range = selection.getRangeAt(0);
+      const rect = rectSnapshot(range.getBoundingClientRect());
+      return rect ? { text: selection.toString().trim(), rect } : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /** 捕获右键时选区的位置，供扩展 context-menu 消息定位浮卡片。 */
+  function captureContextMenuSelection(event) {
+    const selection = window.getSelection();
+    const geometry = readSelectionGeometry(selection);
+    const text = selection && !selection.isCollapsed ? selection.toString().trim() : "";
+    if (!text) {
+      contextMenuSelection = null;
+      return;
+    }
+    contextMenuSelection = {
+      text,
+      rect: geometry && geometry.rect,
+      mouseX: Number.isFinite(event.clientX) ? event.clientX : null,
+      mouseY: Number.isFinite(event.clientY) ? event.clientY : null,
+      timestamp: Date.now()
+    };
+  }
+
+  document.addEventListener("contextmenu", captureContextMenuSelection, true);
+
+  function selectionPlacement(selectionText) {
+    const now = Date.now();
+    const context = contextMenuSelection;
+    if (
+      context && now - context.timestamp <= 30000 &&
+      normalize(context.text) === normalize(selectionText)
+    ) {
+      return context;
+    }
+
+    const current = readSelectionGeometry(window.getSelection());
+    if (current && normalize(current.text) === normalize(selectionText)) {
+      return { rect: current.rect, mouseX: null, mouseY: null, timestamp: now };
+    }
+    return { rect: null, mouseX: null, mouseY: null, timestamp: now };
+  }
+
+  function ensureSelectionCard() {
+    if (selectionCard && selectionCard.root.isConnected) return selectionCard;
+
+    // A content-script reinjection may leave a card from the previous context.
+    document.querySelectorAll(SELECTION_CARD_SELECTOR).forEach((node) => node.remove());
+
+    const root = document.createElement("section");
+    root.className = "local-ai-selection-card";
+    root.setAttribute("data-local-ai-selection-card", "1");
+    root.setAttribute("role", "region");
+    root.setAttribute("aria-label", "所选内容翻译");
+
+    const header = document.createElement("div");
+    header.className = "local-ai-selection-card__header";
+
+    const title = document.createElement("span");
+    title.className = "local-ai-selection-card__title";
+    title.textContent = "Local AI 翻译";
+
+    const status = document.createElement("span");
+    status.className = "local-ai-selection-card__status";
+    status.setAttribute("aria-live", "polite");
+
+    const closeButton = document.createElement("button");
+    closeButton.className = "local-ai-selection-card__close";
+    closeButton.type = "button";
+    closeButton.setAttribute("aria-label", "关闭选区翻译");
+    closeButton.textContent = "×";
+    closeButton.addEventListener("click", () => {
+      if (selectionCard && selectionCard.root === root) selectionGeneration++;
+      root.remove();
+      if (selectionCard && selectionCard.root === root) selectionCard = null;
+    });
+
+    const body = document.createElement("div");
+    body.className = "local-ai-selection-card__body";
+    body.setAttribute("aria-live", "polite");
+
+    header.append(title, status, closeButton);
+    root.append(header, body);
+    selectionCard = { root, status, body };
+    return selectionCard;
+  }
+
+  function placeSelectionCard(card, placement) {
+    const root = card.root;
+    const host = document.body || document.documentElement;
+    if (!root.isConnected && host) host.appendChild(root);
+    if (!root.isConnected) return;
+
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1024;
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 768;
+    root.style.position = "fixed";
+    root.style.zIndex = "2147483647";
+    root.style.right = "auto";
+    root.style.bottom = "auto";
+    root.style.maxWidth = Math.max(0, viewportWidth - 16) + "px";
+    root.style.maxHeight = Math.max(0, viewportHeight - 16) + "px";
+    root.style.left = "0px";
+    root.style.top = "0px";
+    root.style.visibility = "hidden";
+
+    const measured = root.getBoundingClientRect();
+    const cardWidth = measured.width || Math.min(360, Math.max(0, viewportWidth - 16));
+    const cardHeight = measured.height || 160;
+    const rect = placement && placement.rect;
+    let left;
+    let top;
+
+    if (rect) {
+      left = rect.left;
+      top = rect.bottom + 10;
+      if (top + cardHeight > viewportHeight - 8) top = rect.top - cardHeight - 10;
+    } else if (placement && Number.isFinite(placement.mouseX) && Number.isFinite(placement.mouseY)) {
+      left = placement.mouseX + 12;
+      top = placement.mouseY + 12;
+    } else {
+      left = (viewportWidth - cardWidth) / 2;
+      top = (viewportHeight - cardHeight) / 2;
+    }
+
+    const maxLeft = Math.max(8, viewportWidth - cardWidth - 8);
+    const maxTop = Math.max(8, viewportHeight - cardHeight - 8);
+    root.style.left = Math.min(maxLeft, Math.max(8, left)) + "px";
+    root.style.top = Math.min(maxTop, Math.max(8, top)) + "px";
+    root.style.visibility = "visible";
+  }
+
+  function isCurrentSelection(generation) {
+    return generation === selectionGeneration;
+  }
+
+  async function translateSelection(selectionText) {
+    const generation = ++selectionGeneration;
+    const text = typeof selectionText === "string" ? selectionText.trim() : "";
+    const card = ensureSelectionCard();
+    const placement = selectionPlacement(text);
+    contextMenuSelection = null;
+    card.status.textContent = "";
+    card.body.textContent = "";
+    placeSelectionCard(card, placement);
+
+    if (!text) {
+      card.status.textContent = "未找到选中文本";
+      card.body.textContent = "请先选择要翻译的文本。";
+      placeSelectionCard(card, placement);
+      return { ok: false, error: "请先选择要翻译的文本。" };
+    }
+    if (text.length > CFG.hardTextLimit) {
+      const error = "所选内容过长，最多支持 " + CFG.hardTextLimit + " 个字符。";
+      card.status.textContent = "无法翻译";
+      card.body.textContent = error;
+      placeSelectionCard(card, placement);
+      return { ok: false, error };
+    }
+
+    card.status.textContent = "正在翻译…";
+    placeSelectionCard(card, placement);
+    const key = translationCacheKey(text);
+    try {
+      let translation = getCachedTranslation(key);
+      const cached = translation !== null;
+      if (!cached) {
+        const translatedById = await requestBatch([{ id: 0, text }]);
+        // Only the latest selection may cache or render an async result.
+        if (!isCurrentSelection(generation)) return { ok: false, stale: true };
+        translation = translatedById.get(0);
+        if (typeof translation !== "string" || !translation.trim()) {
+          const error = new Error("empty translation");
+          error.kind = "empty";
+          throw error;
+        }
+        if (!isCurrentSelection(generation)) return { ok: false, stale: true };
+        setCachedTranslation(key, translation.trim());
+      }
+
+      if (!isCurrentSelection(generation)) return { ok: false, stale: true };
+      card.status.textContent = "翻译完成";
+      card.body.textContent = translation.trim();
+      placeSelectionCard(card, placement);
+      return { ok: true, cached };
+    } catch (error) {
+      if (!isCurrentSelection(generation)) return { ok: false, stale: true };
+      const messages = {
+        network: "无法连接本机 Ollama，请确认服务已启动。",
+        model: "本地模型不可用，请确认已安装所需模型。",
+        timeout: "翻译请求超时，请稍后重试。",
+        empty: "未获得译文，请重试。"
+      };
+      const friendly = messages[error && error.kind] || "翻译暂时失败，请稍后重试。";
+      card.status.textContent = "翻译失败";
+      card.body.textContent = friendly;
+      placeSelectionCard(card, placement);
+      // Do not log selection text, model output, response payloads, or exception details.
+      console.warn(TAG + " selection translation failed: " + (messages[error && error.kind] ? error.kind : "unknown"));
+      return { ok: false, error: friendly };
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
   /* 插入译文                                                            */
   /* ------------------------------------------------------------------ */
 
@@ -434,6 +790,17 @@
     node.setAttribute("lang", "zh-CN");
     node.textContent = translation;
 
+    if (record.line) {
+      const line = record.line;
+      node.setAttribute(LINE_TRANSLATION_ATTR, "1");
+      if (INLINE_TAGS.has(anchor.tagName)) node.classList.add("local-ai-translation--inline");
+      // The collected source node is stable even if the page moves its BR
+      // boundary while a batch is in flight. Always insert after that source.
+      if (!line.afterNode || line.afterNode.parentNode !== anchor) return null;
+      line.afterNode.after(node);
+      return node;
+    }
+
     const inline = INLINE_TAGS.has(anchor.tagName) || INNER_INSERT_TAGS.has(anchor.tagName);
     if (inline) {
       node.classList.add("local-ai-translation--inline");
@@ -442,6 +809,19 @@
       anchor.parentNode.insertBefore(node, anchor.nextSibling);
     }
     return node;
+  }
+
+  function setRecordTranslating(record, active) {
+    if (record.line) return;
+    record.anchor.classList.toggle("local-ai-translating", active);
+  }
+
+  function recordFailureKey(record) {
+    if (record.line) {
+      failedLineKeys.add(record.line.key);
+      return record.line.key;
+    }
+    return record.anchor;
   }
 
   /* ------------------------------------------------------------------ */
@@ -454,6 +834,10 @@
     return !!(el && el.closest && el.closest("." + CFG.translationClass));
   }
 
+  function isOwnContentUiNode(node) {
+    return isOwnTranslationNode(node) || isSelectionCardNode(node);
+  }
+
   /**
    * 观察到的 mutation 是否可能带来新的可翻译文本。
    * 只做很轻的判断：忽略插件自身产生的 mutation（防止翻译↔观察反馈循环），
@@ -462,15 +846,15 @@
   function mutationMightAddContent(mutations) {
     for (const m of mutations) {
       if (m.type !== "childList") continue;
-      if (isOwnTranslationNode(m.target)) continue;
+      if (isOwnContentUiNode(m.target)) continue;
       const added = m.addedNodes;
       for (let i = 0; i < added.length; i++) {
         const n = added[i];
         if (n.nodeType === 1) {
-          if (isOwnTranslationNode(n)) continue;
+          if (isOwnContentUiNode(n)) continue;
           return true;
         }
-        if (n.nodeType === 3 && normalize(n.nodeValue)) return true; // 直接插入的文本节点
+        if (n.nodeType === 3 && !isOwnContentUiNode(n) && normalize(n.nodeValue)) return true; // 直接插入的文本节点
       }
     }
     return false;
@@ -533,7 +917,7 @@
     sessionGeneration++;                 // 作废所有在途 async 循环
     const r = restoreOriginal();
     partialPending = false;
-    catchupSkipAnchors.clear();
+    clearCatchupSkip();
     session = null;
     sessionProgress = { status: "idle", done: 0, total: 0 };
     return r;
@@ -588,7 +972,7 @@
       });
       if (!batch.length) continue;
 
-      batch.forEach((r) => r.anchor.classList.add("local-ai-translating"));
+      batch.forEach((r) => setRecordTranslating(r, true));
       try {
         const cachePlan = prepareCachedBatch(batch);
         let translatedById = null;
@@ -609,20 +993,19 @@
         if (requestError) console.error(TAG, "动态批次翻译失败:", requestError.name || "error");
         batch.forEach((r) => {
           const translation = byId.get(r.id);
-          if (typeof translation === "string" && translation.trim()) {
-            insertTranslation(r, translation.trim());
-            r.anchor.setAttribute(CFG.sourceAttr, "1");
+          if (typeof translation === "string" && translation.trim() && insertTranslation(r, translation.trim())) {
+            if (!r.line) r.anchor.setAttribute(CFG.sourceAttr, "1");
             translated++;
           } else {
             failed++;
-            failedAnchors.push(r.anchor);
+            failedAnchors.push(recordFailureKey(r));
           }
-          r.anchor.classList.remove("local-ai-translating");
+          setRecordTranslating(r, false);
         });
       } catch (e) {
         console.error(TAG, "动态批次翻译失败:", e && e.name ? e.name : "error");
         failed += batch.length;
-        batch.forEach((r) => { failedAnchors.push(r.anchor); r.anchor.classList.remove("local-ai-translating"); });
+        batch.forEach((r) => { failedAnchors.push(recordFailureKey(r)); setRecordTranslating(r, false); });
       }
       if (!isCurrentSession(myGen)) break;
       sendProgress({ status: "dynamic-translating", done: translated, total: records.length, batch: i + 1, batches: batches.length });
@@ -672,7 +1055,7 @@
     // 新的一轮用户发起翻译：清空上一轮的 partial 状态与自动 retry 跳过集合，
     // 让本次可以显式重试此前失败的 record。
     partialPending = false;
-    catchupSkipAnchors.clear();
+    clearCatchupSkip();
 
     // 开启新会话：换代（作废任何在途旧循环），并持有自己的 generation
     const myGen = ++sessionGeneration;
@@ -744,7 +1127,7 @@
         continue;
       }
 
-      usable.forEach((r) => r.anchor.classList.add("local-ai-translating"));
+      usable.forEach((r) => setRecordTranslating(r, true));
 
       const batchChars = usable.reduce((s, r) => s + r.text.length, 0);
       const bt0 = performance.now();
@@ -771,15 +1154,14 @@
         }
         usable.forEach((r) => {
           const translation = byId.get(r.id);
-          if (typeof translation === "string" && translation.trim()) {
-            insertTranslation(r, translation.trim());
-            r.anchor.setAttribute(CFG.sourceAttr, "1");
+          if (typeof translation === "string" && translation.trim() && insertTranslation(r, translation.trim())) {
+            if (!r.line) r.anchor.setAttribute(CFG.sourceAttr, "1");
             translated++;
           } else {
             failed++;
-            failedAnchors.push(r.anchor);
+            failedAnchors.push(recordFailureKey(r));
           }
-          r.anchor.classList.remove("local-ai-translating");
+          setRecordTranslating(r, false);
         });
       } catch (e) {
         if (!isCurrentSession(myGen)) {
@@ -788,7 +1170,7 @@
         console.error(TAG, "批次翻译失败:", e && e.name ? e.name : "error");
         lastError = e && e.message ? e.message : String(e);
         failed += usable.length;
-        usable.forEach((r) => { failedAnchors.push(r.anchor); r.anchor.classList.remove("local-ai-translating"); });
+        usable.forEach((r) => { failedAnchors.push(recordFailureKey(r)); setRecordTranslating(r, false); });
         // 保留已翻译部分，继续后续批次
       }
       const btMs = Math.round(performance.now() - bt0);
@@ -890,7 +1272,7 @@
     sessionGeneration++;                 // 作废所有在途 async 循环
     const r = restoreOriginal();
     partialPending = false;
-    catchupSkipAnchors.clear();
+    clearCatchupSkip();
     session = null;
     sessionProgress = { status: "idle", done: 0, total: 0 };
     return r;
@@ -923,13 +1305,19 @@
     if (!msg || !msg.type) return false;
 
     if (msg.type === "PING") {
-      sendResponse({ ok: true, version: "0.3.0" });
+      sendResponse({ ok: true, version: "0.4.0" });
       return false;
     }
     if (msg.type === "TRANSLATE_PAGE") {
       translatePage()
         .then((r) => sendResponse(Object.assign({ ok: true }, r)))
         .catch((e) => sendResponse({ ok: false, error: e && e.message ? e.message : String(e) }));
+      return true; // 异步
+    }
+    if (msg.type === "TRANSLATE_SELECTION") {
+      translateSelection(msg.selectionText)
+        .then((r) => sendResponse(r))
+        .catch(() => sendResponse({ ok: false, error: "翻译暂时失败，请稍后重试。" }));
       return true; // 异步
     }
     if (msg.type === "RESTORE_PAGE") {

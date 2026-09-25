@@ -20,6 +20,9 @@ const CFG = self.LOCAL_AI_CONFIG;
 
 const CONTENT_SCRIPTS = ["config.js", "content.js"];
 const CONTENT_STYLES = ["content.css"];
+const SELECTION_MENU_ID = "local-ai-translate-selection";
+let selectionMenuSetupInProgress = false;
+let selectionMenuSetupComplete = false;
 
 /** 已注入过 content script 的 tab，用于页面导航后重新注入 */
 const injectedTabs = new Set();
@@ -291,6 +294,87 @@ async function ensureContentScript(tabId) {
   } catch (e) {
     return { ok: false, reason: e && e.message ? e.message : String(e) };
   }
+}
+
+/** Create the selection menu idempotently across install and browser startup. */
+function createSelectionContextMenu() {
+  if (!chrome.contextMenus || typeof chrome.contextMenus.create !== "function") return;
+  if (selectionMenuSetupInProgress || selectionMenuSetupComplete) return;
+  selectionMenuSetupInProgress = true;
+
+  const create = () => {
+    try {
+      chrome.contextMenus.create({
+        id: SELECTION_MENU_ID,
+        title: "使用 Local AI 翻译选中文本",
+        contexts: ["selection"]
+      }, () => {
+        const error = chrome.runtime.lastError;
+        selectionMenuSetupInProgress = false;
+        if (error) {
+          console.warn("[LAT] 无法创建选中文本菜单");
+        } else {
+          selectionMenuSetupComplete = true;
+        }
+      });
+    } catch (e) {
+      selectionMenuSetupInProgress = false;
+      console.warn("[LAT] 无法创建选中文本菜单");
+    }
+  };
+
+  // A stable id may already exist after a service worker restart or extension
+  // update. Remove only this item before recreating it.
+  if (typeof chrome.contextMenus.remove === "function") {
+    try {
+      chrome.contextMenus.remove(SELECTION_MENU_ID, () => {
+        const error = chrome.runtime.lastError;
+        create();
+      });
+      return;
+    } catch (e) {
+      // Fall through and try creating the item.
+    }
+  }
+  create();
+}
+
+if (chrome.runtime.onInstalled) {
+  chrome.runtime.onInstalled.addListener(createSelectionContextMenu);
+}
+if (chrome.runtime.onStartup) {
+  chrome.runtime.onStartup.addListener(createSelectionContextMenu);
+}
+
+function isInjectableTab(tab) {
+  if (!tab || !Number.isInteger(tab.id) || typeof tab.url !== "string") return false;
+  try {
+    const protocol = new URL(tab.url).protocol;
+    return protocol === "http:" || protocol === "https:";
+  } catch (e) {
+    return false;
+  }
+}
+
+if (chrome.contextMenus && chrome.contextMenus.onClicked) {
+  chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+    if (!info || info.menuItemId !== SELECTION_MENU_ID) return;
+    if (typeof info.selectionText !== "string" || !info.selectionText.trim()) return;
+    if (!isInjectableTab(tab)) return;
+
+    const ready = await ensureContentScript(tab.id);
+    if (!ready || !ready.ok) return;
+
+    try {
+      await chrome.tabs.sendMessage(tab.id, {
+        type: "TRANSLATE_SELECTION",
+        selectionText: info.selectionText
+      });
+    } catch (e) {
+      // Restricted or navigated pages can reject the message after injection.
+      // Keep this path quiet and never include selected text in diagnostics.
+    }
+  });
 }
 
 // 页面导航后 content script 会丢失，若该 tab 之前注入过则重新注入
