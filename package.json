@@ -1,12 +1,13 @@
 {
   "name": "local-ai-assistant",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "description": "Dev/test tooling only. The browser extension itself is plain HTML/CSS/JS with no build step and no runtime npm dependencies.",
   "scripts": {
-    "test": "npm run test:behavior && npm run test:background-model",
+    "test": "npm run test:behavior && npm run test:background-model && npm run test:popup",
     "test:behavior": "node test/behavior-test.js",
-    "test:background-model": "node test/background-model-test.js"
+    "test:background-model": "node test/background-model-test.js",
+    "test:popup": "node test/popup-behavior-test.js"
   },
   "devDependencies": {
     "jsdom": "^30.0.1"

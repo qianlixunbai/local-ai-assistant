@@ -69,6 +69,7 @@
   // 所有 async 翻译循环在 await 之后必须核对自己的 generation，
   // 不匹配即视为 stale，丢弃结果且不得修改任何会话状态（见 v0.2.1 P1-2）。
   let sessionGeneration = 0;
+  let operationId = null;
 
   /** 当前 async 循环是否仍属于最新会话。stale 循环必须放弃一切状态写入。 */
   function isCurrentSession(gen) {
@@ -86,12 +87,11 @@
   // 与 watching 不互斥：页面可以同时 status="partial" 且 watching=true。
   // 运行中（session.running）不设置本标记，由 getStatus 优先返回 translating。
   let partialPending = false;
-  // catch-up 需要跳过的 anchor。动态翻译运行期间，若这些 anchor 再次被标记 dirty，
-  // observer / catch-up 不得重试它们，否则失败 record 会陷入无限重试循环。
+  // catch-up skips failed records until an explicit user retry.
   // 用户再次点击 Translate 时清空（显式重试）。
-  let catchupSkipAnchors = new Set();
-  // BR 段落失败时以该段首个原始 DOM 节点为稳定 key，不跳过同容器的其他段落。
-  const failedLineKeys = new WeakSet();
+  const catchupSkipRecords = new Set();
+  // Stable source-node identities own completion, insertion and explicit retry.
+  const recordStates = new Map();
 
   /* ------------------------------------------------------------------ */
   /* 文本判定                                                            */
@@ -131,23 +131,85 @@
   }
 
   /** 元素是否可见 */
-  const visibilityCache = new WeakMap();
+  let visibilityCache = new WeakMap();
+  function visibleNow(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (typeof el.checkVisibility === "function") {
+      return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+    }
+    const style = window.getComputedStyle(el);
+    if (style.visibility === "hidden" || style.visibility === "collapse") return false;
+    for (let current = el; current; current = current.parentElement) {
+      const currentStyle = window.getComputedStyle(current);
+      if (currentStyle.display === "none" || currentStyle.opacity === "0") return false;
+    }
+    return el.getClientRects().length > 0;
+  }
+
   function isVisible(el) {
     if (!el || el.nodeType !== 1) return false;
     if (visibilityCache.has(el)) return visibilityCache.get(el);
-    let visible;
-    if (typeof el.checkVisibility === "function") {
-      visible = el.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true });
-    } else {
-      visible = el.getClientRects().length > 0;
-    }
+    const visible = visibleNow(el);
     visibilityCache.set(el, visible);
     return visible;
+  }
+
+  /**
+   * 导航 / 独立 overflow 容器只收集当前可读部分。普通文档正文保留
+   * Viewport First 的整页范围；body/html 的文档滚动不当作独立裁剪容器。
+   * 几何信息不跨调用缓存，scroll 后及异步源校验均读取当前布局。
+   */
+  function textClippingBounds(el) {
+    let bounds = el.closest("nav,aside,[role='navigation']") ? {
+      left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight
+    } : null;
+    for (let ancestor = el; ancestor && ancestor !== document.body &&
+        ancestor !== document.documentElement; ancestor = ancestor.parentElement) {
+      const style = window.getComputedStyle(ancestor);
+      if (style.display === "contents" || style.display === "inline") continue;
+      const clips = (value) => /^(auto|scroll|hidden|clip|overlay)$/.test(value);
+      const clipX = clips(style.overflowX || style.overflow);
+      const clipY = clips(style.overflowY || style.overflow);
+      if (!clipX && !clipY) continue;
+      if (!bounds) bounds = { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
+      const rect = ancestor.getBoundingClientRect();
+      // client box excludes borders and scrollbars; rect is in viewport coordinates.
+      const scaleX = ancestor.offsetWidth ? rect.width / ancestor.offsetWidth : 1;
+      const scaleY = ancestor.offsetHeight ? rect.height / ancestor.offsetHeight : 1;
+      const left = rect.left + ancestor.clientLeft * scaleX;
+      const top = rect.top + ancestor.clientTop * scaleY;
+      if (clipX) {
+        bounds.left = Math.max(bounds.left, left);
+        bounds.right = Math.min(bounds.right, left + ancestor.clientWidth * scaleX);
+      }
+      if (clipY) {
+        bounds.top = Math.max(bounds.top, top);
+        bounds.bottom = Math.min(bounds.bottom, top + ancestor.clientHeight * scaleY);
+      }
+    }
+    return bounds;
+  }
+
+  function textIntersectsClip(node) {
+    const bounds = textClippingBounds(node.parentElement);
+    if (!bounds) return true;
+    if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return false;
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const rects = typeof range.getClientRects === "function" ?
+      Array.from(range.getClientRects()) : Array.from(node.parentElement.getClientRects());
+    return rects.some((rect) => Math.min(rect.right, bounds.right) > Math.max(rect.left, bounds.left) &&
+      Math.min(rect.bottom, bounds.bottom) > Math.max(rect.top, bounds.top));
+  }
+
+  function isCollectibleText(node) {
+    return isVisible(node.parentElement) && textIntersectsClip(node);
   }
 
   /** 元素是否「纯文本块」：子元素全部为行内（没有块级子元素） */
   function isTextBlock(el) {
     for (let child = el.firstElementChild; child; child = child.nextElementSibling) {
+      if (isOwnContentUiNode(child)) continue;
       if (!INLINE_TAGS.has(child.tagName)) return false;
     }
     return true;
@@ -178,25 +240,108 @@
     return !!(next && next.classList.contains(CFG.translationClass) && !next.hasAttribute(LINE_TRANSLATION_ATTR));
   }
 
-  /** 锚点是否仍需要翻译（未断开、无译文、未标记 source）。用于 partial 追踪剪枝。 */
-  function anchorStillNeedsWork(anchor) {
-    if (failedLineKeys.has(anchor)) return anchor.isConnected;
-    return !!anchor && anchor.isConnected && !hasTranslation(anchor) && !anchor.hasAttribute(CFG.sourceAttr);
+  function isEditable(el) {
+    if (String(document.designMode).toLowerCase() === "on") return true;
+    for (let current = el; current; current = current.parentElement) {
+      const value = current.getAttribute("contenteditable");
+      if (value === null || !["", "true", "false", "plaintext-only"].includes(value.toLowerCase())) continue;
+      return value.toLowerCase() !== "false";
+    }
+    return false;
   }
 
-  /** 剪除已成功 / 已断开的 anchor；剩余集合即「仍然失败、等待显式重试」的 record。 */
+  function sourceNodes(anchor) {
+    const nodes = [];
+    const walker = document.createTreeWalker(anchor, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      if (!isOwnContentUiNode(node)) nodes.push(node);
+    }
+    return nodes;
+  }
+
+  function lineSourceNodes(line) {
+    return line.nodes.flatMap((node) => node.nodeType === 3 ? [node] : sourceNodes(node));
+  }
+
+  function readableSource(node) {
+    const parent = node.parentElement;
+    return !!parent && !parent.closest(SKIP_SELECTOR) &&
+      !(PRUNE_SELECTOR && parent.closest(PRUNE_SELECTOR)) && !isOwnContentUiNode(node) &&
+      !isEditable(parent) && visibleNow(parent);
+  }
+
+  function sourceSnapshot(nodes) {
+    return nodes.map((node) => ({ node, text: normalize(node.nodeValue), readable: readableSource(node),
+      inClip: textIntersectsClip(node) }));
+  }
+
+  function matchesSourceSnapshot(nodes, snapshot) {
+    return nodes.length === snapshot.length && nodes.every((node, i) =>
+      node === snapshot[i].node && normalize(node.nodeValue) === snapshot[i].text &&
+      readableSource(node) === snapshot[i].readable &&
+      // Scrolling completed source out of view does not delete its translation.
+      // Newly exposed, previously omitted inline source must refresh the aggregate.
+      (snapshot[i].inClip || !snapshot[i].readable || !textIntersectsClip(node)));
+  }
+
+  function isLineBoundary(node) {
+    return node.nodeType === 1 && !isOwnContentUiNode(node) &&
+      (node.tagName === "BR" || !INLINE_TAGS.has(node.tagName) || node.querySelector("br"));
+  }
+
+  function currentLineNodes(line) {
+    let start = line.nodes[0];
+    if (!start || start.parentNode !== line.anchor) return [];
+    while (start.previousSibling && !isLineBoundary(start.previousSibling)) start = start.previousSibling;
+    const nodes = [];
+    for (let node = start; node && !isLineBoundary(node); node = node.nextSibling) {
+      if ((node.nodeType === 1 || node.nodeType === 3) && !isOwnContentUiNode(node)) nodes.push(node);
+    }
+    return nodes;
+  }
+
+  function sourceIsCurrent(record) {
+    if (recordStates.get(record.key) !== record.state) return false;
+    if (!record.anchor.isConnected || isEditable(record.anchor)) return false;
+    if (!record.source.every((item) => item.node.isConnected &&
+        item.node.parentNode === item.parent && record.anchor.contains(item.node) &&
+        normalize(item.node.nodeValue) === item.text)) return false;
+    if (record.line) {
+      if (!record.line.afterNode || record.line.afterNode.parentNode !== record.anchor ||
+          !record.line.nodes.every((node) => node.parentNode === record.anchor)) return false;
+      const nodes = currentLineNodes(record.line);
+      if (nodes.length !== record.line.nodes.length || nodes.some((node, i) => node !== record.line.nodes[i])) return false;
+      const current = lineSourceNodes(record.line);
+      return matchesSourceSnapshot(current, record.lineSource);
+    }
+    const current = sourceNodes(record.anchor);
+    return matchesSourceSnapshot(current, record.anchorSource);
+  }
+
+  function reconcileSources() {
+    for (const [key, state] of recordStates) {
+      if (sourceIsCurrent(state.record) && (!state.translation || state.translation.isConnected)) continue;
+      if (state.translation) state.translation.remove();
+      state.record.anchor.removeAttribute(CFG.sourceAttr);
+      state.record.anchor.classList.remove("local-ai-translating");
+      recordStates.delete(key);
+      catchupSkipRecords.delete(state);
+    }
+    partialPending = catchupSkipRecords.size > 0;
+  }
+
   function pruneCatchupSkip() {
-    catchupSkipAnchors.forEach((a) => {
-      if (!anchorStillNeedsWork(a)) {
-        catchupSkipAnchors.delete(a);
-        failedLineKeys.delete(a);
+    reconcileSources();
+    catchupSkipRecords.forEach((state) => {
+      if (state.translation || recordStates.get(state.record.key) !== state || !sourceIsCurrent(state.record)) {
+        catchupSkipRecords.delete(state);
       }
     });
   }
 
   function clearCatchupSkip() {
-    catchupSkipAnchors.forEach((a) => failedLineKeys.delete(a));
-    catchupSkipAnchors.clear();
+    catchupSkipRecords.clear();
   }
 
   /* ------------------------------------------------------------------ */
@@ -248,6 +393,7 @@
 
     const gather = (node) => {
       if (node.nodeType === 3) {
+        if (!isCollectibleText(node)) return;
         segment.textNodes.push(node);
         const piece = normalize(node.nodeValue);
         if (piece) segment.pieces.push(piece);
@@ -256,8 +402,7 @@
       if (node.nodeType !== 1) return;
       if (node.matches(SKIP_SELECTOR) || (PRUNE_SELECTOR && node.matches(PRUNE_SELECTOR)) ||
           node.matches(SELECTION_CARD_SELECTOR) || node.classList.contains(CFG.translationClass) ||
-          node.hasAttribute(CFG.sourceAttr) ||
-          node.querySelector(":scope > ." + CFG.translationClass) || !isVisible(node)) return;
+          isEditable(node) || !isVisible(node)) return;
       for (let child = node.firstChild; child; child = child.nextSibling) gather(child);
     };
 
@@ -288,6 +433,9 @@
    * 返回数组 [{ id, text, anchor, domOrder }]
    */
   function collectRecords(root) {
+    visibilityCache = new WeakMap();
+    reconcileSources();
+    const ownedAnchors = new Set(Array.from(recordStates.values(), (state) => state.record.anchor));
     const scope = root || document.body || document.documentElement;
     const walker = document.createTreeWalker(
       scope,
@@ -315,12 +463,13 @@
       if (PRUNE_SELECTOR && parent.closest(PRUNE_SELECTOR)) continue;
       if (parent.closest(SELECTION_CARD_SELECTOR)) continue;
       if (parent.closest("." + CFG.translationClass)) continue;
+      if (isEditable(parent) || !isCollectibleText(node)) continue;
 
       const breakContainer = findBreakContainer(node, directBreakCache, nestedBreakCache);
       if (breakContainer) {
         // A translated container from an older content-script version remains owned by that version.
         const next = breakContainer.nextElementSibling;
-        if (breakContainer.hasAttribute(CFG.sourceAttr) ||
+        if ((!ownedAnchors.has(breakContainer) && breakContainer.hasAttribute(CFG.sourceAttr)) ||
             (next && next.classList.contains(CFG.translationClass) && !next.hasAttribute(LINE_TRANSLATION_ATTR))) continue;
         if (!indexedBreakContainers.has(breakContainer)) {
           indexBreakSegments(breakContainer, breakSegmentsByText);
@@ -329,18 +478,15 @@
         const line = breakSegmentsByText.get(node);
         if (!line || line.emitted) continue;
         line.emitted = true;
-        if (line.translated || catchupSkipAnchors.has(line.key) || !isVisible(breakContainer) ||
+        if ((line.translated && !ownedAnchors.has(breakContainer)) || !isVisible(breakContainer) ||
             !isTranslatableText(line.text)) continue;
-        records.push({ id: id++, text: line.text, anchor: breakContainer, line, domOrder: records.length });
+        records.push({ id: id++, text: line.text, anchor: breakContainer, line, textNodes: line.textNodes, domOrder: records.length });
         continue;
       }
 
       const anchor = findAnchor(node);
       if (!anchor || !anchor.parentNode) continue;
-      if (anchor.hasAttribute(CFG.sourceAttr)) continue;
-      if (hasTranslation(anchor)) continue;
-      // partial 会话：自动 retry 跳过本轮已知失败的 anchor（用户显式重试会清空该集合）
-      if (catchupSkipAnchors.has(anchor)) continue;
+      if (!ownedAnchors.has(anchor) && (anchor.hasAttribute(CFG.sourceAttr) || hasTranslation(anchor))) continue;
       if (!isVisible(anchor)) continue;
 
       const piece = normalize(node.nodeValue);
@@ -350,18 +496,40 @@
       const prev = lastByAnchor.get(anchor);
       if (prev && prev.text.length + 1 + piece.length <= CFG.recordCharLimit) {
         prev.text = normalize(prev.text + " " + piece);
+        prev.textNodes.push(node);
         continue;
       }
 
       // 新锚点：只接受本身有翻译价值的文本
       if (!isTranslatableText(piece)) continue;
 
-      const rec = { id: id++, text: piece, anchor, domOrder: records.length };
+      const rec = { id: id++, text: piece, anchor, textNodes: [node], domOrder: records.length };
       lastByAnchor.set(anchor, rec);
       records.push(rec);
     }
 
-    return records;
+    const counts = new Map();
+    const snapshots = new Map();
+    records.forEach((record) => counts.set(record.anchor, (counts.get(record.anchor) || 0) + 1));
+    return records.filter((record) => {
+      record.source = record.textNodes.map((node) => ({ node, parent: node.parentNode, text: normalize(node.nodeValue) }));
+      record.key = record.textNodes[0];
+      record.segmented = !record.line && counts.get(record.anchor) > 1;
+      if (record.line) {
+        record.lineSource = sourceSnapshot(lineSourceNodes(record.line));
+      } else {
+        if (!snapshots.has(record.anchor)) snapshots.set(record.anchor,
+          sourceSnapshot(sourceNodes(record.anchor)));
+        record.anchorSource = snapshots.get(record.anchor);
+      }
+      let state = recordStates.get(record.key);
+      if (!state) {
+        state = { record, translation: null };
+        recordStates.set(record.key, state);
+      }
+      record.state = state;
+      return !state.translation && !catchupSkipRecords.has(state);
+    });
   }
 
   /* ------------------------------------------------------------------ */
@@ -447,13 +615,23 @@
 
     if (!resp) throw new Error("background 未响应。");
     if (!resp.ok) {
-      const error = new Error(resp.error || "翻译请求失败。");
+      const error = new Error("本地翻译请求失败，请重试。");
       error.kind = resp.kind;
       throw error;
     }
 
     const byId = new Map();
-    (resp.results || []).forEach((r) => byId.set(Number(r.id), r.translation));
+    const requested = new Set(items.map((item) => item.id));
+    const seen = new Set();
+    const duplicates = new Set();
+    (Array.isArray(resp.results) ? resp.results : []).forEach((r) => {
+      if (!r || !Number.isInteger(r.id) || !requested.has(r.id)) return;
+      if (seen.has(r.id)) { duplicates.add(r.id); byId.delete(r.id); return; }
+      seen.add(r.id);
+      if (!duplicates.has(r.id) && typeof r.translation === "string" && r.translation.trim()) {
+        byId.set(r.id, r.translation.trim());
+      }
+    });
     return byId;
   }
 
@@ -782,7 +960,7 @@
   /** 译文插入位置：行内锚点插入内部，块级锚点插入其后。 */
   function insertTranslation(record, translation) {
     const anchor = record.anchor;
-    if (!anchor || !anchor.parentNode) return null;
+    if (!anchor || !anchor.parentNode || !sourceIsCurrent(record)) return null;
 
     const node = document.createElement("div");
     node.className = CFG.translationClass;
@@ -798,16 +976,22 @@
       // boundary while a batch is in flight. Always insert after that source.
       if (!line.afterNode || line.afterNode.parentNode !== anchor) return null;
       line.afterNode.after(node);
-      return node;
-    }
-
-    const inline = INLINE_TAGS.has(anchor.tagName) || INNER_INSERT_TAGS.has(anchor.tagName);
-    if (inline) {
-      node.classList.add("local-ai-translation--inline");
-      anchor.appendChild(node);
+    } else if (record.segmented) {
+      // Keep each ordinary segment immediately after its own last source node.
+      record.textNodes[record.textNodes.length - 1].after(node);
     } else {
-      anchor.parentNode.insertBefore(node, anchor.nextSibling);
+      const inline = INLINE_TAGS.has(anchor.tagName) || INNER_INSERT_TAGS.has(anchor.tagName);
+      if (inline) {
+        node.classList.add("local-ai-translation--inline");
+        anchor.appendChild(node);
+      } else {
+        anchor.parentNode.insertBefore(node, anchor.nextSibling);
+      }
     }
+    record.state.translation = node;
+    // An anchor marker means ALL of its ordinary records have completed.
+    const states = Array.from(recordStates.values()).filter((state) => state.record.anchor === anchor);
+    if (!record.line && states.every((state) => state.translation)) anchor.setAttribute(CFG.sourceAttr, "1");
     return node;
   }
 
@@ -817,11 +1001,7 @@
   }
 
   function recordFailureKey(record) {
-    if (record.line) {
-      failedLineKeys.add(record.line.key);
-      return record.line.key;
-    }
-    return record.anchor;
+    return record.state;
   }
 
   /* ------------------------------------------------------------------ */
@@ -841,28 +1021,29 @@
   /**
    * 观察到的 mutation 是否可能带来新的可翻译文本。
    * 只做很轻的判断：忽略插件自身产生的 mutation（防止翻译↔观察反馈循环），
-   * 其余一律标记 dirty，交给 debounce 后的 collectRecords 过滤。
+   * 源文本 / 可见性 / 编辑边界变化标记 dirty，交给 debounce 后的 collectRecords。
    */
   function mutationMightAddContent(mutations) {
     for (const m of mutations) {
-      if (m.type !== "childList") continue;
       if (isOwnContentUiNode(m.target)) continue;
-      const added = m.addedNodes;
-      for (let i = 0; i < added.length; i++) {
-        const n = added[i];
-        if (n.nodeType === 1) {
-          if (isOwnContentUiNode(n)) continue;
-          return true;
+      if (m.type === "characterData") return true;
+      if (m.type === "attributes") {
+        if (m.attributeName === "class") {
+          const withoutProgressClass = (value) => (value || "").split(/\s+/)
+            .filter((name) => name && name !== "local-ai-translating").sort().join(" ");
+          if (withoutProgressClass(m.oldValue) === withoutProgressClass(m.target.getAttribute("class"))) continue;
         }
-        if (n.nodeType === 3 && !isOwnContentUiNode(n) && normalize(n.nodeValue)) return true; // 直接插入的文本节点
+        return true;
       }
+      if (m.type === "childList" && [...m.addedNodes, ...m.removedNodes].some((node) =>
+        (node.nodeType === 1 || node.nodeType === 3) && !isOwnContentUiNode(node))) return true;
     }
     return false;
   }
 
   /**
    * 启动监听。仅在用户主动翻译后调用。
-   * observer 回调只标记 dirty + schedule debounce，不做扫描 / 请求。
+   * observer 回调校验源身份、清理失效译文并 schedule debounce，不发请求。
    */
   function startWatching() {
     if (!CFG.dynamicTranslateEnabled) return;
@@ -874,18 +1055,26 @@
     observer = new MutationObserver((mutations) => {
       if (!watching) return;
       if (!mutationMightAddContent(mutations)) return;
+      reconcileSources();
       dirty = true;
       scheduleDynamic(CFG.mutationDebounceMs);
     });
     observer.observe(document.body || document.documentElement, {
       childList: true,
-      subtree: true
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeOldValue: true,
+      attributeFilter: ["hidden", "style", "class", "contenteditable", "aria-hidden"]
     });
+    // Element scroll events do not bubble. Capture also covers future containers.
+    document.addEventListener("scroll", onContentScroll, true);
     console.log(TAG + " dynamic watcher started");
   }
 
   /** 停止监听并清掉所有待处理状态（Restore 时调用）。 */
   function stopWatching() {
+    document.removeEventListener("scroll", onContentScroll, true);
     if (dynamicTimer) {
       clearTimeout(dynamicTimer);
       dynamicTimer = null;
@@ -897,6 +1086,12 @@
     if (watching) console.log(TAG + " dynamic watcher stopped");
     watching = false;
     dirty = false;
+  }
+
+  function onContentScroll(event) {
+    if (!watching || isOwnContentUiNode(event.target)) return;
+    dirty = true;
+    scheduleDynamic(CFG.mutationDebounceMs);
   }
 
   function scheduleDynamic(delay) {
@@ -912,14 +1107,15 @@
   }
 
   /** 由 popup 明确要求恢复：停止监听 + 换代作废在途请求 + 删除译文。 */
-  function restorePage() {
+  function restorePage(nextOperationId) {
     stopWatching();
     sessionGeneration++;                 // 作废所有在途 async 循环
+    operationId = typeof nextOperationId === "string" ? nextOperationId : null;
     const r = restoreOriginal();
     partialPending = false;
     clearCatchupSkip();
     session = null;
-    sessionProgress = { status: "idle", done: 0, total: 0 };
+    sessionProgress = { status: "idle", done: 0, total: 0, operationId, sessionGeneration };
     return r;
   }
 
@@ -931,7 +1127,7 @@
   }
 
   /**
-   * 收集尚未翻译的新增 record 并顺序翻译。与首次翻译共用
+   * 收集尚未翻译的新增或失效 record 并顺序翻译。与首次翻译共用
    * collectRecords / isTranslatableText / findAnchor / hasTranslation /
    * buildBatches / requestBatch / insertTranslation。
    * 动态批次不使用 Viewport First 的小首批规则（record 通常较少）。
@@ -957,7 +1153,7 @@
 
     let translated = 0;
     let failed = 0;
-    const failedAnchors = [];
+    const failedRecords = [];
 
     for (let i = 0; i < batches.length; i++) {
       // stale 会话（Restore / 新翻译）：立即退出，绝不写入任何状态
@@ -990,22 +1186,22 @@
         }
         const byId = resolveCachedBatch(cachePlan, translatedById, myGen);
         if (!byId) break;
-        if (requestError) console.error(TAG, "动态批次翻译失败:", requestError.name || "error");
+        if (requestError) console.error(TAG, "动态批次翻译失败:", "request");
         batch.forEach((r) => {
+          if (!sourceIsCurrent(r)) { dirty = true; setRecordTranslating(r, false); return; }
           const translation = byId.get(r.id);
           if (typeof translation === "string" && translation.trim() && insertTranslation(r, translation.trim())) {
-            if (!r.line) r.anchor.setAttribute(CFG.sourceAttr, "1");
             translated++;
           } else {
             failed++;
-            failedAnchors.push(recordFailureKey(r));
+            failedRecords.push(recordFailureKey(r));
           }
           setRecordTranslating(r, false);
         });
       } catch (e) {
-        console.error(TAG, "动态批次翻译失败:", e && e.name ? e.name : "error");
+        console.error(TAG, "动态批次翻译失败:", "request");
         failed += batch.length;
-        batch.forEach((r) => { failedAnchors.push(recordFailureKey(r)); setRecordTranslating(r, false); });
+        batch.forEach((r) => { failedRecords.push(recordFailureKey(r)); setRecordTranslating(r, false); });
       }
       if (!isCurrentSession(myGen)) break;
       sendProgress({ status: "dynamic-translating", done: translated, total: records.length, batch: i + 1, batches: batches.length });
@@ -1017,17 +1213,17 @@
     session = null;
     console.log(TAG + " dynamic translation done: " + translated + " records");
 
-    // 本次动态翻译仍失败的 anchor 加入 catchup 跳过集合，防止 observer / catch-up
+    // 本次动态翻译仍失败的 record 加入 catchup 跳过集合，防止 observer / catch-up
     // 自动重试造成无限循环。用户再次点击 Translate 会清空该集合并显式重试。
-    failedAnchors.forEach((a) => catchupSkipAnchors.add(a));
-    // 剪除已被翻译 / 已断开的 anchor，再由剩余失败集推导 partial。
+    failedRecords.forEach((a) => catchupSkipRecords.add(a));
+    // 剪除已成功 / 已失效的 record，再由剩余失败集推导 partial。
     pruneCatchupSkip();
-    partialPending = catchupSkipAnchors.size > 0;
+    partialPending = catchupSkipRecords.size > 0;
 
     if (watching) {
       sendProgress({ status: partialPending ? "partial" : "watching", done: translated, total: records.length });
       // 本轮翻译期间又出现新增内容：再排一轮增量。
-      // catchupSkipAnchors 保证本轮已失败的 anchor 不会被自动重试，避免无限循环。
+      // catchupSkipRecords 保证本轮已失败的 record 不会被自动重试，避免无限循环。
       if (dirty) scheduleDynamic(0);
     }
   }
@@ -1035,7 +1231,7 @@
 
 
   function sendProgress(partial) {
-    sessionProgress = Object.assign({}, sessionProgress, partial);
+    sessionProgress = Object.assign({}, sessionProgress, partial, { operationId, sessionGeneration });
     try {
       const p = chrome.runtime.sendMessage({ type: "TRANSLATION_PROGRESS", progress: sessionProgress });
       // popup 可能已关闭，此时消息端口关闭会 reject，忽略即可
@@ -1045,12 +1241,10 @@
     }
   }
 
-  async function translatePage() {
+  async function translatePage(nextOperationId) {
     if (session && session.running) {
       return { ok: false, error: "翻译正在进行中。" };
     }
-
-    const already = document.querySelectorAll("." + CFG.translationClass).length;
 
     // 新的一轮用户发起翻译：清空上一轮的 partial 状态与自动 retry 跳过集合，
     // 让本次可以显式重试此前失败的 record。
@@ -1059,12 +1253,14 @@
 
     // 开启新会话：换代（作废任何在途旧循环），并持有自己的 generation
     const myGen = ++sessionGeneration;
+    operationId = typeof nextOperationId === "string" ? nextOperationId : null;
     const mySession = { running: true };
     session = mySession;
     lastError = "";
 
     const t0 = performance.now();
     const records = collectRecords();
+    const already = document.querySelectorAll("." + CFG.translationClass).length;
     const totalChars = records.reduce((s, r) => s + r.text.length, 0);
 
     if (!records.length) {
@@ -1103,7 +1299,7 @@
     let translated = 0;
     let failed = 0;
     let skipped = 0;
-    const failedAnchors = [];            // partial 时进入自动 retry 跳过集合
+    const failedRecords = [];            // partial 时进入自动 retry 跳过集合
     let firstTranslationVisibleMs = null;
     let firstBatchDone = false;
 
@@ -1149,17 +1345,17 @@
         const byId = resolveCachedBatch(cachePlan, translatedById, myGen);
         if (!byId) return { ok: false, stale: true, cancelled: true };
         if (requestError) {
-          console.error(TAG, "批次翻译失败:", requestError.name || "error");
-          lastError = requestError && requestError.message ? requestError.message : String(requestError);
+          console.error(TAG, "批次翻译失败:", "request");
+          lastError = "本地翻译请求失败，请重试。";
         }
         usable.forEach((r) => {
+          if (!sourceIsCurrent(r)) { dirty = true; setRecordTranslating(r, false); return; }
           const translation = byId.get(r.id);
           if (typeof translation === "string" && translation.trim() && insertTranslation(r, translation.trim())) {
-            if (!r.line) r.anchor.setAttribute(CFG.sourceAttr, "1");
             translated++;
           } else {
             failed++;
-            failedAnchors.push(recordFailureKey(r));
+            failedRecords.push(recordFailureKey(r));
           }
           setRecordTranslating(r, false);
         });
@@ -1167,10 +1363,10 @@
         if (!isCurrentSession(myGen)) {
           return { ok: false, stale: true, cancelled: true };
         }
-        console.error(TAG, "批次翻译失败:", e && e.name ? e.name : "error");
-        lastError = e && e.message ? e.message : String(e);
+        console.error(TAG, "批次翻译失败:", "request");
+        lastError = "翻译暂时失败，请稍后重试。";
         failed += usable.length;
-        usable.forEach((r) => { failedAnchors.push(recordFailureKey(r)); setRecordTranslating(r, false); });
+        usable.forEach((r) => { failedRecords.push(recordFailureKey(r)); setRecordTranslating(r, false); });
         // 保留已翻译部分，继续后续批次
       }
       const btMs = Math.round(performance.now() - bt0);
@@ -1221,9 +1417,9 @@
 
     // partial 是独立业务状态，不会被后续 watcher 覆盖：本会话仍有失败 record
     // 时登记它们并置位，自动 retry（observer / catch-up）将跳过它们，避免无限循环。
-    failedAnchors.forEach((a) => catchupSkipAnchors.add(a));
+    failedRecords.forEach((a) => catchupSkipRecords.add(a));
     pruneCatchupSkip();
-    partialPending = catchupSkipAnchors.size > 0;
+    partialPending = catchupSkipRecords.size > 0;
 
     // 首次整页翻译完成后才正式进入监听；随后立即做一次 catch-up，
     // 补翻「本次翻译期间新增、但 observer 尚未启动」的 DOM（见 v0.2.1 P1-1）。
@@ -1248,8 +1444,7 @@
   }
 
   /**
-   * 移除所有译文与标记，但不取消正在进行的批次。
-   * （翻译过程中点击「恢复原文」应只删除当前已有译文，不影响已发出的请求）
+   * Remove translations and source identities; callers invalidate in-flight sessions.
    */
   function restoreOriginal() {
     const nodes = document.querySelectorAll("." + CFG.translationClass);
@@ -1263,23 +1458,26 @@
       el.classList.remove("local-ai-translating");
     });
 
+    recordStates.clear();
     return { ok: true, removed };
   }
 
   /** 完全取消当前会话（重新翻译前调用，确保旧批次停止且清空旧译文）。 */
-  function resetSession() {
+  function resetSession(nextOperationId) {
     stopWatching();
     sessionGeneration++;                 // 作废所有在途 async 循环
+    operationId = typeof nextOperationId === "string" ? nextOperationId : null;
     const r = restoreOriginal();
     partialPending = false;
     clearCatchupSkip();
     session = null;
-    sessionProgress = { status: "idle", done: 0, total: 0 };
+    sessionProgress = { status: "idle", done: 0, total: 0, operationId, sessionGeneration };
     return r;
   }
 
   /** 页面状态以真实 DOM 为准（可靠状态来源，不依赖 background 内存）。 */
   function getStatus() {
+    reconcileSources();
     const translated = document.querySelectorAll("." + CFG.translationClass).length;
     const running = !!(session && session.running);
     // 优先级：translating / dynamic-translating > partial > watching > translated > idle
@@ -1294,7 +1492,8 @@
     } else if (translated > 0) {
       status = "translated";
     }
-    return { ok: true, status, watching, translated, progress: sessionProgress };
+    return { ok: true, status, watching, translated, operationId, sessionGeneration,
+      progress: Object.assign({}, sessionProgress, { operationId, sessionGeneration }) };
   }
 
   /* ------------------------------------------------------------------ */
@@ -1305,13 +1504,13 @@
     if (!msg || !msg.type) return false;
 
     if (msg.type === "PING") {
-      sendResponse({ ok: true, version: "0.4.0" });
+      sendResponse({ ok: true, version: "0.4.1" });
       return false;
     }
     if (msg.type === "TRANSLATE_PAGE") {
-      translatePage()
+      translatePage(msg.operationId)
         .then((r) => sendResponse(Object.assign({ ok: true }, r)))
-        .catch((e) => sendResponse({ ok: false, error: e && e.message ? e.message : String(e) }));
+        .catch((e) => sendResponse({ ok: false, error: "页面操作失败，请重试。" }));
       return true; // 异步
     }
     if (msg.type === "TRANSLATE_SELECTION") {
@@ -1322,17 +1521,17 @@
     }
     if (msg.type === "RESTORE_PAGE") {
       try {
-        sendResponse(restorePage());
+        sendResponse(restorePage(msg.operationId));
       } catch (e) {
-        sendResponse({ ok: false, error: e && e.message ? e.message : String(e) });
+        sendResponse({ ok: false, error: "页面操作失败，请重试。" });
       }
       return false;
     }
     if (msg.type === "LAT_RESET") {
       try {
-        sendResponse(resetSession());
+        sendResponse(resetSession(msg.operationId));
       } catch (e) {
-        sendResponse({ ok: false, error: e && e.message ? e.message : String(e) });
+        sendResponse({ ok: false, error: "页面操作失败，请重试。" });
       }
       return false;
     }

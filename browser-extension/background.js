@@ -21,10 +21,11 @@ const CFG = self.LOCAL_AI_CONFIG;
 const CONTENT_SCRIPTS = ["config.js", "content.js"];
 const CONTENT_STYLES = ["content.css"];
 const SELECTION_MENU_ID = "local-ai-translate-selection";
+const CONNECTION_TIMEOUT_MS = 5000;
 let selectionMenuSetupInProgress = false;
 let selectionMenuSetupComplete = false;
 
-/** 已注入过 content script 的 tab，用于页面导航后重新注入 */
+/** 已注入过顶层 content script 的 tab，用于页面导航后重新注入 */
 const injectedTabs = new Set();
 
 function ollamaUrl(path) {
@@ -40,48 +41,95 @@ function ollamaUrl(path) {
  * 返回 { online, available, reason }
  */
 async function checkConnection() {
-  let versionResp;
+  let versionResult;
   try {
-    versionResp = await fetch(ollamaUrl("/api/version"), { method: "GET" });
+    versionResult = await withRequestDeadline(
+      CONNECTION_TIMEOUT_MS,
+      "连接 Ollama 超时。",
+      async (signal) => {
+        const resp = await fetch(ollamaUrl("/api/version"), { method: "GET", signal });
+        if (!resp.ok) return { resp };
+        let data;
+        try {
+          data = await resp.json();
+        } catch (e) {
+          if (signal.aborted) throw e;
+          throw latError("parse", "Ollama 版本响应无法解析。");
+        }
+        return { resp, data };
+      }
+    );
   } catch (e) {
-    console.error("[LAT] /api/version 请求失败:", e);
-    return { online: false, available: false, reason: "无法连接 " + CFG.ollamaBaseUrl + "，请确认 Ollama 已启动。" };
+    if (e && e.kind === "parse") {
+      return { online: true, available: false, reason: "Ollama 在线，但版本响应无法解析。" };
+    }
+    return {
+      online: false,
+      available: false,
+      reason: e && e.kind === "timeout" ? e.message : "无法连接本机 Ollama，请确认 Ollama 已启动。"
+    };
   }
 
+  const versionResp = versionResult.resp;
   if (!versionResp.ok) {
-    return { online: false, available: false, reason: "Ollama 响应异常：HTTP " + versionResp.status };
+    return {
+      online: false,
+      available: false,
+      status: versionResp.status,
+      reason: "Ollama 响应异常：HTTP " + versionResp.status
+    };
   }
 
-  let versionData;
+  const versionData = versionResult.data;
+  const rawVersion = versionData && versionData.version;
+  const version = typeof rawVersion === "string" && /^[A-Za-z0-9._-]{1,32}$/.test(rawVersion)
+    ? rawVersion
+    : "";
+
+  let tagsResult;
   try {
-    versionData = await versionResp.json();
+    tagsResult = await withRequestDeadline(
+      CONNECTION_TIMEOUT_MS,
+      "读取 Ollama 模型列表超时。",
+      async (signal) => {
+        const resp = await fetch(ollamaUrl("/api/tags"), { method: "GET", signal });
+        if (!resp.ok) return { resp };
+        let data;
+        try {
+          data = await resp.json();
+        } catch (e) {
+          if (signal.aborted) throw e;
+          throw latError("parse", "Ollama 模型列表无法解析。");
+        }
+        return { resp, data };
+      }
+    );
   } catch (e) {
-    console.error("[LAT] /api/version JSON 解析失败:", e);
-    return { online: true, available: false, reason: "Ollama 在线，但返回内容无法解析。" };
+    return {
+      online: true,
+      available: false,
+      version,
+      reason: e && e.kind === "timeout"
+        ? e.message
+        : e && e.kind === "parse"
+          ? "Ollama 在线，但模型列表无法解析。"
+          : "Ollama 在线，但读取模型列表失败。"
+    };
   }
-  const version = versionData && versionData.version ? versionData.version : "";
 
-  let tagsResp;
-  try {
-    tagsResp = await fetch(ollamaUrl("/api/tags"), { method: "GET" });
-  } catch (e) {
-    console.error("[LAT] /api/tags 请求失败:", e);
-    return { online: true, available: false, version, reason: "Ollama 在线，但读取模型列表失败。" };
-  }
-
+  const tagsResp = tagsResult.resp;
   if (!tagsResp.ok) {
-    return { online: true, available: false, version, reason: "Ollama 在线，但模型列表返回 HTTP " + tagsResp.status };
+    return {
+      online: true,
+      available: false,
+      version,
+      status: tagsResp.status,
+      reason: "Ollama 在线，但模型列表返回 HTTP " + tagsResp.status
+    };
   }
 
-  let tagsData;
-  try {
-    tagsData = await tagsResp.json();
-  } catch (e) {
-    console.error("[LAT] /api/tags JSON 解析失败:", e);
-    return { online: true, available: false, version, reason: "Ollama 在线，但模型列表无法解析。" };
-  }
-
-  const models = Array.isArray(tagsData.models) ? tagsData.models : [];
+  const tagsData = tagsResult.data;
+  const models = tagsData && Array.isArray(tagsData.models) ? tagsData.models : [];
   // Ollama tags may expose the full model name as either `name` or `model`.
   // Keep the configured tag intact so another size/tag cannot satisfy the check.
   const found = models.some(
@@ -137,10 +185,68 @@ const SYSTEM_PROMPT =
  * 带有分类的错误，便于上层判断是否可重试。
  * kind: "network" | "timeout" | "http4xx" | "http5xx" | "parse" | "model" | "unsupported"
  */
-function latError(kind, message) {
+function latError(kind, message, status) {
   const e = new Error(message);
   e.kind = kind;
+  e.isLatError = true;
+  if (Number.isInteger(status) && status >= 100 && status <= 599) e.status = status;
   return e;
+}
+
+/** Keep the deadline active through response-body reads, not just until headers arrive. */
+async function withRequestDeadline(timeoutMs, timeoutMessage, operation) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    return await operation(controller.signal);
+  } catch (e) {
+    if (e && e.kind) throw e;
+    if (timedOut || (e && e.name === "AbortError")) {
+      throw latError("timeout", timeoutMessage);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function validateRequestedIds(items) {
+  if (!Array.isArray(items)) throw latError("unsupported", "翻译请求无效。");
+  const ids = new Set();
+  for (const item of items) {
+    if (!item || !Number.isSafeInteger(item.id) || item.id < 0 || typeof item.text !== "string" || ids.has(item.id)) {
+      throw latError("unsupported", "翻译请求无效。");
+    }
+    ids.add(item.id);
+  }
+  return ids;
+}
+
+/** Return only unique, numeric IDs requested in this batch. Invalid or duplicate IDs stay missing. */
+function collectRequestedResults(results, requestedIds) {
+  const byId = new Map();
+  const seen = new Set();
+  const invalid = new Set();
+
+  results.forEach((result) => {
+    if (!result || !Number.isSafeInteger(result.id) || result.id < 0 || !requestedIds.has(result.id)) return;
+    if (seen.has(result.id)) {
+      byId.delete(result.id);
+      invalid.add(result.id);
+      return;
+    }
+    seen.add(result.id);
+    if (typeof result.translation !== "string" || !result.translation.trim()) return;
+    byId.set(result.id, result.translation.trim());
+  });
+
+  invalid.forEach((id) => byId.delete(id));
+  return byId;
 }
 
 /**
@@ -150,6 +256,7 @@ function latError(kind, message) {
  * @returns {Promise<Map<number,string>>} id → 译文
  */
 async function translateBatch(items) {
+  const requestedIds = validateRequestedIds(items);
   const body = {
     model: CFG.model,
     stream: false,
@@ -167,76 +274,63 @@ async function translateBatch(items) {
     ]
   };
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CFG.requestTimeoutMs);
-
-  let resp;
   try {
-    resp = await fetch(ollamaUrl("/api/chat"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: controller.signal
-    });
+    return await withRequestDeadline(
+      CFG.requestTimeoutMs,
+      "Ollama 请求超时（超过 " + Math.round(CFG.requestTimeoutMs / 1000) + " 秒）。",
+      async (signal) => {
+        const resp = await fetch(ollamaUrl("/api/chat"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal
+        });
+
+        if (!resp.ok) {
+          if (resp.status === 404) throw latError("model", "模型 " + CFG.model + " 不存在。", resp.status);
+          if (resp.status >= 400 && resp.status < 500) {
+            throw latError("http4xx", "Ollama 请求失败（HTTP " + resp.status + "）。", resp.status);
+          }
+          throw latError("http5xx", "Ollama 服务异常（HTTP " + resp.status + "）。", resp.status);
+        }
+
+        let data;
+        try {
+          data = await resp.json();
+        } catch (e) {
+          if (signal.aborted) throw e;
+          throw latError("parse", "Ollama 响应无法解析为 JSON。");
+        }
+
+        if (data && data.error) {
+          const err = String(data.error);
+          if (/not found|no such model|does not exist/i.test(err)) {
+            throw latError("model", "模型 " + CFG.model + " 不可用。");
+          }
+          throw latError("http5xx", "Ollama 返回错误。");
+        }
+
+        const content = data && data.message && typeof data.message.content === "string"
+          ? data.message.content
+          : "";
+        if (!content) throw latError("parse", "Ollama 未返回翻译内容。");
+
+        let results;
+        try {
+          results = parseTranslationJSON(content);
+        } catch (e) {
+          throw latError("parse", "Ollama 响应无法解析为翻译结果。");
+        }
+        return collectRequestedResults(results, requestedIds);
+      }
+    );
   } catch (e) {
-    console.error("[LAT] /api/chat 请求失败:", e && e.name ? e.name : "network");
+    if (e && e.isLatError) throw e;
     if (e && e.name === "AbortError") {
       throw latError("timeout", "Ollama 请求超时（超过 " + Math.round(CFG.requestTimeoutMs / 1000) + " 秒）。");
     }
-    throw latError("network", "无法连接 Ollama（" + CFG.ollamaBaseUrl + "）。");
-  } finally {
-    clearTimeout(timer);
+    throw latError("network", "无法连接本机 Ollama。");
   }
-
-  if (!resp.ok) {
-    let detail = "";
-    try {
-      detail = await resp.text();
-    } catch (e) {
-      /* ignore */
-    }
-    const msg = "Ollama 返回 HTTP " + resp.status + (detail ? "：" + detail.slice(0, 200) : "");
-    if (resp.status === 404) throw latError("model", "模型 " + CFG.model + " 不存在。");
-    if (resp.status >= 400 && resp.status < 500) throw latError("http4xx", msg);
-    throw latError("http5xx", msg);
-  }
-
-  let data;
-  try {
-    data = await resp.json();
-  } catch (e) {
-    throw latError("parse", "Ollama 响应无法解析为 JSON。");
-  }
-
-  if (data.error) {
-    const err = String(data.error);
-    // 模型未加载 / 不存在属于不可重试
-    if (/not found|no such model|does not exist/i.test(err)) {
-      throw latError("model", "模型 " + CFG.model + " 不可用：" + err);
-    }
-    throw latError("http5xx", "Ollama 错误：" + err);
-  }
-
-  const content = data && data.message && typeof data.message.content === "string"
-    ? data.message.content
-    : "";
-  if (!content) throw latError("parse", "Ollama 未返回翻译内容。");
-
-  let results;
-  try {
-    results = parseTranslationJSON(content);
-  } catch (e) {
-    console.error("[LAT] JSON 解析失败，响应长度:", content.length);
-    throw latError("parse", e.message);
-  }
-
-  const byId = new Map();
-  results.forEach((r) => {
-    if (r && typeof r.id !== "undefined" && typeof r.translation === "string") {
-      byId.set(Number(r.id), r.translation.trim());
-    }
-  });
-  return byId;
 }
 
 /** 判断某个错误是否值得重试（网络瞬时失败 / 5xx / JSON 解析失败） */
@@ -267,32 +361,96 @@ async function translateBatchWithRetry(items) {
 /* content script 注入                                                 */
 /* ------------------------------------------------------------------ */
 
-async function ensureContentScript(tabId) {
+function normalizeSelectedText(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function failedInjection() {
+  return { ok: false, reason: "无法在目标页面安全注入扩展脚本。" };
+}
+
+/** Inject and message only the requested frame/document. A missing frame never means frame 0. */
+async function ensureContentScript(tabId, frameId, expectedDocumentId, expectedSelectionText) {
+  if (!Number.isInteger(tabId) || !Number.isInteger(frameId) || frameId < 0) return failedInjection();
+
+  const expectedSelection = typeof expectedSelectionText === "string"
+    ? normalizeSelectedText(expectedSelectionText)
+    : null;
+  let probe;
   try {
-    await chrome.tabs.sendMessage(tabId, { type: "PING" });
-    return { ok: true };
+    const probes = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      func: (expected) => {
+        if (expected === null) return true;
+        const active = document.activeElement;
+        let selected = "";
+        if (active && /^(INPUT|TEXTAREA)$/.test(active.tagName)) {
+          if (active.tagName === "INPUT" && String(active.type).toLowerCase() === "password") return false;
+          if (Number.isInteger(active.selectionStart) && Number.isInteger(active.selectionEnd) &&
+              active.selectionEnd > active.selectionStart) {
+            selected = active.value.slice(active.selectionStart, active.selectionEnd);
+          }
+        }
+        if (!selected) {
+          const selection = window.getSelection();
+          if (!selection || selection.isCollapsed) return false;
+          selected = selection.toString();
+        }
+        return selected.replace(/\s+/g, " ").trim() === expected;
+      },
+      args: [expectedSelection]
+    });
+    probe = Array.isArray(probes) ? probes.find((entry) => entry && entry.frameId === frameId) : null;
   } catch (e) {
-    /* 未注入，继续注入 */
+    return failedInjection();
+  }
+  if (!probe || (expectedSelection !== null && probe.result !== true)) return failedInjection();
+  if (expectedSelection !== null && (typeof probe.documentId !== "string" || !probe.documentId)) {
+    return failedInjection();
+  }
+
+  if (typeof expectedDocumentId !== "undefined" && expectedDocumentId !== null) {
+    if (typeof expectedDocumentId !== "string" || !expectedDocumentId || probe.documentId !== expectedDocumentId) {
+      return failedInjection();
+    }
+  }
+
+  const documentId = typeof probe.documentId === "string" && probe.documentId ? probe.documentId : null;
+  const injectionTarget = documentId
+    ? { tabId, documentIds: [documentId] }
+    : { tabId, frameIds: [frameId] };
+  const messageOptions = documentId ? { documentId } : { frameId };
+
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: "PING" }, messageOptions);
+    if (frameId === 0) injectedTabs.add(tabId);
+    return { ok: true, frameId, documentId, messageOptions };
+  } catch (e) {
+    /* Not injected in this exact document; inject below. */
   }
 
   try {
-    await chrome.scripting.insertCSS({ target: { tabId }, files: CONTENT_STYLES });
+    await chrome.scripting.insertCSS({ target: injectionTarget, files: CONTENT_STYLES });
   } catch (e) {
-    console.warn("[LAT] insertCSS 失败:", e && e.message);
+    // A stylesheet failure must not expose browser or page details in logs.
   }
 
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: CONTENT_SCRIPTS });
-    injectedTabs.add(tabId);
+    const injected = await chrome.scripting.executeScript({ target: injectionTarget, files: CONTENT_SCRIPTS });
+    const exactTargetWasInjected = Array.isArray(injected) && injected.some((entry) =>
+      entry && entry.frameId === frameId && (!documentId || entry.documentId === documentId)
+    );
+    if (!exactTargetWasInjected) return failedInjection();
+    if (frameId === 0) injectedTabs.add(tabId);
   } catch (e) {
-    return { ok: false, reason: e && e.message ? e.message : String(e) };
+    return failedInjection();
   }
 
   try {
-    await chrome.tabs.sendMessage(tabId, { type: "PING" });
-    return { ok: true };
+    await chrome.tabs.sendMessage(tabId, { type: "PING" }, messageOptions);
+    return { ok: true, frameId, documentId, messageOptions };
   } catch (e) {
-    return { ok: false, reason: e && e.message ? e.message : String(e) };
+    return failedInjection();
   }
 }
 
@@ -360,16 +518,20 @@ if (chrome.contextMenus && chrome.contextMenus.onClicked) {
   chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     if (!info || info.menuItemId !== SELECTION_MENU_ID) return;
     if (typeof info.selectionText !== "string" || !info.selectionText.trim()) return;
+    if (!Number.isInteger(info.frameId) || info.frameId < 0) return;
+    if (typeof info.documentId !== "undefined" && info.documentId !== null &&
+        (typeof info.documentId !== "string" || !info.documentId)) return;
     if (!isInjectableTab(tab)) return;
 
-    const ready = await ensureContentScript(tab.id);
+    const ready = await ensureContentScript(tab.id, info.frameId, info.documentId, info.selectionText);
     if (!ready || !ready.ok) return;
 
     try {
       await chrome.tabs.sendMessage(tab.id, {
         type: "TRANSLATE_SELECTION",
-        selectionText: info.selectionText
-      });
+        selectionText: info.selectionText,
+        selectionTarget: { frameId: ready.frameId, documentId: ready.documentId }
+      }, ready.messageOptions);
     } catch (e) {
       // Restricted or navigated pages can reject the message after injection.
       // Keep this path quiet and never include selected text in diagnostics.
@@ -381,8 +543,8 @@ if (chrome.contextMenus && chrome.contextMenus.onClicked) {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status !== "loading" || !injectedTabs.has(tabId)) return;
   injectedTabs.delete(tabId);
-  chrome.scripting.insertCSS({ target: { tabId }, files: CONTENT_STYLES }).catch(() => {});
-  chrome.scripting.executeScript({ target: { tabId }, files: CONTENT_SCRIPTS }).catch(() => {});
+  chrome.scripting.insertCSS({ target: { tabId, frameIds: [0] }, files: CONTENT_STYLES }).catch(() => {});
+  chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: CONTENT_SCRIPTS }).catch(() => {});
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => injectedTabs.delete(tabId));
@@ -393,7 +555,8 @@ chrome.tabs.onRemoved.addListener((tabId) => injectedTabs.delete(tabId));
 
 const handlers = {
   async ENSURE_CONTENT_SCRIPT(msg) {
-    return ensureContentScript(msg.tabId);
+    const ready = await ensureContentScript(msg.tabId, 0);
+    return { ok: ready.ok, reason: ready.reason };
   },
 
   async CHECK_CONNECTION() {
@@ -410,27 +573,27 @@ const handlers = {
 
   /** 预热模型（加载进显存并保持 keep_alive），下一次翻译不必等待加载。 */
   async WARMUP() {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), CFG.requestTimeoutMs);
     try {
-      const resp = await fetch(ollamaUrl("/api/chat"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: CFG.model,
-          stream: false,
-          think: CFG.think,
-          keep_alive: CFG.keepAlive,
-          options: { num_ctx: CFG.num_ctx, num_predict: 1 },
-          messages: [{ role: "user", content: "hi" }]
-        }),
-        signal: controller.signal
+      const resp = await withRequestDeadline(CFG.requestTimeoutMs, "Ollama 预热超时。", async (signal) => {
+        const response = await fetch(ollamaUrl("/api/chat"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: CFG.model,
+            stream: false,
+            think: CFG.think,
+            keep_alive: CFG.keepAlive,
+            options: { num_ctx: CFG.num_ctx, num_predict: 1 },
+            messages: [{ role: "user", content: "hi" }]
+          }),
+          signal
+        });
+        if (response.ok) await response.arrayBuffer();
+        return response;
       });
       return { warm: resp.ok };
     } catch (e) {
       return { warm: false };
-    } finally {
-      clearTimeout(timer);
     }
   },
 
@@ -449,12 +612,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   handlers[msg.type](msg, sender)
     .then((data) => sendResponse({ ok: true, ...data }))
     .catch((e) => {
-      console.error("[LAT] 处理 " + msg.type + " 失败:", e && e.kind ? e.kind : "error");
-      sendResponse({
+      const allowedKinds = ["network", "timeout", "http4xx", "http5xx", "parse", "model", "unsupported"];
+      const kind = e && allowedKinds.includes(e.kind) ? e.kind : "unknown";
+      const message = e && e.isLatError && typeof e.message === "string"
+        ? e.message
+        : "本地翻译请求失败，请重试。";
+      console.error("[LAT] 后台请求失败:", kind);
+      const response = {
         ok: false,
-        error: e && e.message ? e.message : String(e),
-        kind: e && e.kind ? e.kind : "unknown"
-      });
+        error: message,
+        kind
+      };
+      if (e && e.isLatError && Number.isInteger(e.status)) response.status = e.status;
+      sendResponse(response);
     });
 
   return true; // 异步响应，保持消息通道打开

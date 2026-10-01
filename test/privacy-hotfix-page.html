@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Local AI Assistant v0.4.1 acceptance fixture</title>
+<style>
+  body { max-width: 900px; margin: 32px auto; font: 17px/1.6 sans-serif; }
+  iframe { width: 100%; height: 150px; }
+  [contenteditable] { border: 1px solid #888; padding: 12px; }
+  .nested-layout { display: grid; grid-template-columns: 250px 1fr; gap: 24px; }
+  .nested-sidebar { position: sticky; top: 12px; align-self: start; }
+  .nested-scroll { height: 220px; overflow-y: auto; border: 2px solid #888; padding: 8px; }
+  .nested-scroll li { margin-bottom: 16px; }
+  .nested-example { min-height: 400px; }
+</style>
+<body>
+<h1>Stability and privacy acceptance fixture</h1>
+<p>Serve the repository on port 8000 and open this page using 127.0.0.1. Use the extension to translate, restore, update the source, reveal content, and translate selections inside each frame.</p>
+<button id="replace">Replace dynamic source</button>
+<button id="characters">Change source text node</button>
+<button id="reveal">Reveal hidden paragraph</button>
+<h2 id="nested">Nested scroll container acceptance</h2>
+<p>Translate with the sidebar at the top. Only readable sidebar items should receive translations. Scroll inside its bordered box: newly exposed items should be translated after the debounce delay. Scroll back to check that completed items keep their translations. Restore and scroll again: translation should stay stopped.</p>
+<section class="nested-layout">
+  <aside class="nested-sidebar">
+    <nav class="nested-scroll" aria-label="Guide fixture navigation">
+      <ul>
+        <li><a href="#nested">Grammar and types</a></li>
+        <li>Control flow and error handling</li>
+        <li>Loops and iteration</li>
+        <li>Functions and expressions</li>
+        <li>Numbers and strings</li>
+        <li>Dates and regular expressions</li>
+        <li>Indexed and keyed collections</li>
+        <li>Objects and classes</li>
+        <li>Promises and generators</li>
+        <li>Resource management and modules</li>
+      </ul>
+      <p>Visible sidebar words <span style="display:none">NESTED_HIDDEN_INLINE_SECRET</span>remain readable.</p>
+      <div>First visible sidebar BR line.<br>Second sidebar BR line.</div>
+      <details><summary>Collapsed sidebar section</summary><p>COLLAPSED_SIDEBAR_SECRET</p></details>
+      <p aria-hidden="true">ARIA_HIDDEN_SIDEBAR_SECRET</p>
+      <div contenteditable="plaintext-only">Editable sidebar draft should only translate through explicit selection.</div>
+    </nav>
+  </aside>
+  <div class="nested-example">
+    <p>Normal article content should translate while the independent sidebar retains its own scrolling and sticky position.</p>
+    <p>Hidden inline, collapsed sections and editable text must remain outside full-page translation requests.</p>
+  </div>
+</section>
+<p id="dynamic">Original English paragraph for a dynamic source replacement.</p>
+<p id="hidden" style="display:none">Newly revealed English paragraph should become eligible for translation.</p>
+<p>Visible English content <span style="display:none">HIDDEN_INLINE_FIXTURE_SECRET</span><span>remains grouped into one visible record.</span></p>
+<p id="long"><span>The first long English segment describes a local translator that keeps the original page intact. Its translation should appear directly after this segment, before the next English segment. This paragraph deliberately contains enough characters to exercise the ordinary record boundary without relying on a site-specific layout or changing the production configuration. It also provides a stable source node for checking translation order and restoring the original text.</span> <strong>The second long English segment should receive its own translation after the bold source text. A successful first segment must not hide a failed second segment from an explicit retry. This second segment also exceeds the default aggregation limit so that the two source nodes remain separate records. After restoring the page and translating again, successful cached results should appear in the same source order without creating duplicate translations.</strong></p>
+<div contenteditable="true">Editable English draft must not receive full-page translation nodes. An explicitly selected phrase may still be translated in a selection card.</div>
+<h2>Same-origin frame</h2>
+<iframe title="Same origin selection" srcdoc="<!doctype html><p>Select this English sentence inside the same-origin frame and use the translation context menu.</p>"></iframe>
+<h2>Cross-origin frame</h2>
+<iframe title="Cross origin selection" src="http://localhost:8000/test/privacy-hotfix-page.html?frame=1"></iframe>
+<script>
+  if (location.search === '?frame=1') {
+    document.body.replaceChildren(Object.assign(document.createElement('p'), {
+      textContent: 'Select this English sentence inside the cross-origin frame. The translation must stay in this frame or fail safely.'
+    }));
+  } else {
+    document.getElementById('replace').onclick = () => {
+      document.getElementById('dynamic').textContent = 'Replacement English paragraph must never retain the previous translation.';
+    };
+    document.getElementById('characters').onclick = () => {
+      document.getElementById('dynamic').firstChild.nodeValue = 'Updated English text node must receive a fresh matching translation.';
+    };
+    document.getElementById('reveal').onclick = () => {
+      document.getElementById('hidden').style.display = 'block';
+    };
+  }
+</script>
+</body>
+</html>

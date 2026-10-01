@@ -6,6 +6,65 @@ Minimal High-Value Testing：优先用少量完整行为场景覆盖真实用户
 避免测试实现细节及重复的历史回归；一个场景可以包含多个必要断言。
 新增测试须有明确回归价值，测试数量和覆盖率百分比不是项目目标。
 
+## 版本状态（v0.4.1）
+
+**Result: GO / RELEASED** —— v0.4.1 Stability & Privacy Hotfix；2026-10-01 用户确认真实 Chrome 验收全部通过，进入最终封版。
+manifest / package.json / package-lock.json / content PING 与当前文档版本均为 v0.4.1。
+历史上代码与自动测试完成后曾保持 PARTIAL / uncommitted；下述用户验收结论关闭该等待状态。
+
+本轮保持 Route C：Chrome Extension → background execution boundary → 本机 Ollama。
+没有新 UI、权限、持久化存储、Provider Framework 或 Local AI Core。
+
+| 项目 | 状态 | 修复边界 |
+|---|---|---|
+| B01 record granularity | FIXED / PASS | 普通 multi-record anchor 按源节点追踪每段完成、失败与重试；只重试失败段，译文跟随各自源文本；anchor 标记仅在全部段成功后设置。 |
+| B02 popup operation cancellation | FIXED / PASS | popup 独立 operation generation；每个异步返回及 finally 校验操作身份，Restore 作废旧 preflight。 |
+| B03 source DOM identity | FIXED / PASS | record 保存源节点、父节点与规范化文本快照；插入前校验连接、归属和文本。childList / characterData 更新会清除旧译文、marker 与失败身份，并重新收集。 |
+| B04 frame privacy | FIXED / PASS | 选区消息绑定 tab / frame / document；无法确认目标时 fail closed，没有回落到 top frame 或扩大权限。用户确认真实 Chrome iframe / frame boundary PASS。 |
+| B05 visibility cache | FIXED / PASS | WeakMap 限于单次 collect，下一次扫描重新判断可见性。 |
+| B06 hidden inline text | FIXED / PASS | 普通和 BR 提取均检查源文本父元素的可见性，隐藏子节点不进入请求。 |
+| B07 request deadline | FIXED / PASS | 翻译 deadline 覆盖 fetch、响应体读取及解析；连接检查两个 endpoint 各使用 5 秒 deadline。 |
+| B08 popup tab / task isolation | FIXED / PASS | sender.tab.id 与 operationId / sessionGeneration 过滤；重开 popup 从 GET_STATUS 恢复任务身份。 |
+| B09 response protocol | FIXED / PASS | 仅接受本次请求的整数 ID；重复 ID 视为 missing，非法 / 意外 ID 忽略；content 层再次校验，异常结果不进入缓存。 |
+| B10 editable boundary | FIXED / PASS | 全文跳过有效 contenteditable / plaintext-only / designMode；显式选区翻译继续可用。 |
+| B13 visible sidebar / nested scroll | FIXED / PASS（真实 Chrome） | 根因是 PRUNE_SELECTOR 过早排除 nav / aside / role=navigation，全文 collect 不创建 sidebar records。修复允许 navigation/sidebar 参与翻译，按 nested overflow clipping visibility 过滤，独立 scroll catch-up 复用既有流程；hidden/editable/privacy boundary 保持。真实 MDN Chrome 验收通过。 |
+| R02 error privacy | FIXED / PASS | HTTP / service / parse 错误使用受控文案与 kind / status；不转发原始响应体、服务错误或异常信息。 |
+| B11 inline BR layout | DEFERRED | 本次不补做，未宣称修复；保留既有 inline BR 样式。 |
+| B12 mutation debounce starvation | DEFERRED | 保留现有 debounce，没有引入 max-wait 或复杂调度器。 |
+| R01 MV3 long request lifecycle | PASS（真实 Chrome） | 用户确认单次 30–45 秒 long-request 验收通过；测试方法及证据范围见 hotfix report 的 MV3 Long Request。没有引入 offscreen、保活 ping、alarm、daemon 或新服务。 |
+
+源 DOM 改变会作废 DOM 插入身份；同一 generation 内，对原始文本 A 的合法成功响应仍可缓存 A，
+但不能插入已变为 B 的源区域。Restore / LAT_RESET 保留页面内存缓存并作废旧会话。
+对 reinjection 前已有的 orphan translation 继续保守沿用既有标记，不猜测其源身份。
+
+高价值自动回归覆盖：普通同 anchor 部分失败 / 单段重试 / 顺序与缓存；旧 preflight / finally
+不覆盖 Restore 或后续 Translate；在途源替换 / 完成后 childList 与 characterData 更新；
+BR 更新与自身 mutation 隔离；隐藏展开 / 隐藏 inline / 编辑边界；严格 ID 与错误隐私；
+跨 tab / 旧操作 progress 过滤。现有 viewport、Footer、动态补翻、selection、Restore 和缓存回归保留。
+B13 新增 5 个行为场景；修改前源码会遗漏可见导航，修改后通过。详细根因与验证见 hotfix report。
+
+人工验收页：`test/privacy-hotfix-page.html`。从仓库根目录运行 `python -m http.server 8000 --bind 127.0.0.1`，
+打开 `http://127.0.0.1:8000/test/privacy-hotfix-page.html`；跨 origin frame 使用 `localhost`。
+该页用于长正文顺序、preflight Restore、动态源更新、frame selection、隐藏展开与可编辑区回归；
+部分失败 / 只重试失败段主要由自动测试保护。fixture 包含 sticky sidebar / nested scroll 区域。
+
+自动验证：`npm ci`、`npm test`、`git diff --check` 通过。完整 diff 已检查，权限未扩大，
+生产文件无测试 fixture 引用、临时日志、个人路径或凭据。
+
+历史自动执行记录：检测到 Chrome 154.0.8037.59，但以独立临时 profile 加载测试扩展的
+启动操作被执行策略以 `blocked by policy` 拒绝，未产生测试浏览器进程。
+当时 **B04 Chrome UNVERIFIED；B11 未验证；R01 >30 秒请求 UNVERIFIED / Risk**，未记为 NOT REPRODUCED。
+临时本地测试服务已停止；原有 Ollama 服务未改动。执行策略也拒绝临时目录的递归清理，
+该目录保留在系统 TEMP 中，不属于仓库变更。
+
+最终真实 Chrome 验收（2026-10-01，用户确认）：B01–B10、B13、R01、R02 均 PASS。
+iframe / frame boundary、Selection Translation、Dynamic Content、Restore、cache second-hit、
+editable / designMode privacy boundary、popup reconnect / progress 均 PASS。
+真实 MDN Chrome 验收通过：sidebar 当前可见文字可翻译，独立滚动可 catch-up，回滚不重复翻译，
+Restore 后滚动不再翻译，折叠 / 隐藏内容仍保持排除。
+R01 已通过真实 Chrome 单次 30–45 秒 long-request 验证；方法与历史限制见 hotfix report。
+B11 / B12 继续 DEFERRED，不在本次补做；在已验收范围内无已知 release-blocking risk。
+
 ## 版本状态（v0.4.0）
 
 **Result: GO** —— v0.4.0 已通过真实 Chrome 人工验收与自动验证。
@@ -139,7 +198,7 @@ Reviewer 发现上一版 P2 存在两个边界问题，本轮修复：
   用户再次点击 Translate 时清空该集合，显式重试。`pruneCatchupSkip()` 会在每轮结束时
   剪除已成功 / 已断开的 anchor，并由剩余集合推导 `partial`，避免「后续成功轮次误清 partial」
 
-## 当前实际配置（v0.4.0）
+## 当前实际配置（v0.4.1）
 
 以 `browser-extension/config.js` 为事实来源（**本文件数值与其保持同步**）：
 
@@ -203,7 +262,7 @@ Tool Calling、截图 / Vision 等。
   被 `span` 拆开的连续文本（如 `Posted` + `4d ago`）合并为一条；
   链接等行内元素单独成条，译文插入其内部
 - 过滤：`script / style / noscript / code / pre / textarea / input / button /
-  select / option / nav / aside / [aria-hidden] / [hidden] /
+  select / option / [aria-hidden='true'] / [hidden] /
   隐藏元素 / 纯数字 / URL / email / 路径 / 极短单词 / 纯符号`
 - `footer` / `[role='contentinfo']` **不**整体排除：页脚含大量有意义的导航与
   链接文本，正常参与翻译；`<a>` 只替换/追加文本，不改动 `href` / `target` / 点击行为
@@ -212,14 +271,15 @@ Tool Calling、截图 / Vision 等。
   分为 Priority 0（当前视口）/ 1（视口上下各 1 个视口高度内）/ 2（其余），
   同 priority 内保持原始 DOM 顺序；**首批目标约 1000 字符**（`firstBatchCharLimit`），
   让当前屏幕尽快出现中文，后续批次恢复 2800 上限。仅改变翻译顺序，不会减少
-  最终翻译范围（整页仍全部翻译）。仅在翻译开始时计算一次优先级，不做滚动监听
+  普通文档正文的最终翻译范围。导航与独立 overflow 容器只翻译当前可见部分；
+  激活 watcher 后，捕获 scroll 并复用动态 catch-up，补翻新进入可视区的文字
 - 性能日志：console 输出 `viewport-first: visibleRecords/nearRecords/restRecords/firstBatchChars`、
   `first translation visible in Ns`、`total translation time Ns`
 - **Dynamic Content（v0.2.0 引入）**：首次整页翻译完成后启动 `MutationObserver`
-  （`document.body`，`childList + subtree`，**不监听 `characterData`**）。
-  observer 回调只做轻量判断 + debounce（默认 750ms，`mutationDebounceMs`），
+  （`document.body`，`childList + characterData + subtree`，并监听可见性 / 编辑状态相关属性）。
+  observer 回调忽略自身 mutation、校验已有源身份并清理失效译文；debounce（默认 750ms，`mutationDebounceMs`）后，
   到点后复用同一套 `collectRecords` / 过滤 / 锚点 / 去重 / 分批 / 插入，
-  仅翻译新增 record；动态批次直接用 2800 上限（不套用 Viewport First 的 1000 首批）。
+  仅翻译新增或失效 record；动态批次直接用 2800 上限（不套用 Viewport First 的 1000 首批）。
   日志：`dynamic watcher started` / `mutations detected` / `dynamic collect` /
   `dynamic translation done` / `dynamic watcher stopped`
 - **防反馈循环**：observer 忽略 `.local-ai-translation` 自身及其内部节点产生的
@@ -280,7 +340,7 @@ content.js ─┘                                （唯一访问 Ollama 的地�
 
 - 初始翻译在用户点击「翻译当前页面」时收集当前页面内容；首轮翻译处理完成后开启
   watcher，并立即进行 catch-up 扫描，补翻首轮处理期间新增的 DOM。之后，
-  `MutationObserver`（`childList + subtree`）自动检测动态新增内容；debounce 750ms 后
+  `MutationObserver`（`childList + characterData + subtree`）自动检测动态新增内容与源正文更新；debounce 750ms 后
   仅收集**尚未翻译**的新 record 并增量翻译，已翻译内容不会重发。`Load More Jobs`、
   无限滚动及 SPA 局部更新均可触发增量翻译。Restore 会停止 watcher；再次点击翻译可重新开启。
   限制：
@@ -306,8 +366,9 @@ content.js ─┘                                （唯一访问 Ollama 的地�
   因此本轮不使用 structured output，改为依靠输入 JSON 数组 + 文本解析
   （该结论为历史测试记录，与当前默认模型 4B 无关）
 - 单条文本 2800–12000 字符单独成批；超过 12000 字符的节点被跳过并记录
-- 页面 UI 噪声靠 `nav/aside/button` 等通用选择器排除，未做站点专用规则；
-  少数站点仍可能有遗漏或误判（`footer` 已不再整体排除，见上文）
+- 页面 UI 控件靠 `button` 与既有 role 选择器排除，未做站点专用规则；
+  `nav/aside/[role='navigation']` 的普通文字按真实可见交集参与翻译，overflow 裁剪内容待滚动补翻。
+  少数站点仍可能有遗漏或误判（`footer` 不整体排除，见上文）
 - 部分使用 Shadow DOM 或极度动态渲染的站点可能提取不到正文
 - popup 内不做长任务保活：翻译进行中关闭 popup，进度条不会更新（任务本身继续，
   译文会正常插入页面）
@@ -333,3 +394,13 @@ content.js ─┘                                （唯一访问 Ollama 的地�
 P2 重复点击幂等 + partial 状态机补充修复），未新增任何功能：无翻译缓存 / 划词翻译 /
 右键菜单 / 设置页 / 多模型 UI / 语言选择 / `addedNodes` 局部扫描优化 / streaming /
 OCR / PDF / RAG / Agent / 桌面助手 / history router hook / 新架构。
+
+## Route C / Local AI Core Trigger
+
+Core = LATER。只有以下任一需求真正开始实现才进入 Stage 2：
+
+1. Desktop Assistant 需要共享 translate / chat / health / model execution。
+2. 跨应用 queue / cancel / GPU scheduling。
+3. 本地文件 / RAG indexing 需要长期后台任务。
+
+届时优先评估 Java 21 + Spring Boot 模块化单体；v0.4.1 保持现有扩展架构。

@@ -65,14 +65,14 @@
     // 多个小文本片段合并成一条 record 的上限（如 "Posted" + "4d ago"）
     recordCharLimit: 400,
 
-    // 页面 UI 噪声容器，其内部文本一律不翻译。
+    // 页面 UI 控件 / 隐藏区域，其内部文本一律不翻译。
+    // nav / aside / navigation 的普通文字交由 content.js 检查真实可见交集。
     // 注意：footer / [role='contentinfo'] 不在此列——页脚含大量有意义的
     // 导航与链接文本，交由 content.js 正常提取（<a> 只改文本，不动 href/target）。
     // 下方硬排除标签（script/style/code/button/svg 等）由 content.js 的
     // SKIP_SELECTOR 兜底，此处无需重复。
     pruneSelectors: [
-      "nav", "aside",
-      "[role='navigation']", "[role='banner']",
+      "[role='banner']",
       "[role='menu']", "[role='menubar']", "[role='tablist']", "[role='toolbar']",
       "[aria-hidden='true']", "[hidden]"
     ],

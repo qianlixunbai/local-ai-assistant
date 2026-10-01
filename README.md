@@ -5,7 +5,7 @@
 
 ## 当前状态
 
-**Browser Translator v0.4.0 — GO**
+**Browser Translator v0.4.1 — GO / RELEASED**
 
 一个 Chrome / Chromium 浏览器扩展（Manifest V3），用于将英文网页正文
 翻译为中文。原文保留，中文译文显示在原文下方，可一键恢复原文。
@@ -26,6 +26,10 @@
 
 > 范围仍限定为「浏览器本地 AI 翻译插件」。
 > 桌面助手 / RAG / Tool Calling / Vision / 截图翻译等均为后续阶段。
+
+v0.4.1 **Stability & Privacy Hotfix**：改善 Restore / Translate 取消稳定性、动态 DOM 源版本处理，以及 frame / 可编辑正文的安全边界。
+用户已确认真实 Chrome 验收通过，包括真实 MDN sidebar / nested scroll-container 与 R01 MV3 30–45 秒 long-request；
+B01–B10 / B13 / R01 / R02 均 PASS，B11 / B12 继续 DEFERRED。详见 [v0.4.1 hotfix report](docs/V0.4.1_HOTFIX_REPORT.md)。
 
 ## 环境要求
 
@@ -93,11 +97,12 @@ npm ci
 npm test
 ```
 
-`npm test` 顺序执行综合行为测试与精确模型检测测试。也可单独运行：
+`npm test` 顺序执行综合行为测试、background 模型 / 协议检查与 popup 生命周期测试。也可单独运行：
 
 ```bash
 npm run test:behavior
 npm run test:background-model
+npm run test:popup
 ```
 
 > `package.json` 与 `node_modules/` **仅供测试 / 开发**。

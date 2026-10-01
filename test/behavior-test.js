@@ -19,10 +19,26 @@ function makeEnv(html, options = {}) {
   const { window } = dom;
   const { document } = window;
 
-  window.Element.prototype.checkVisibility = function () {
+  // jsdom leaves overflow shorthand unexpanded in computed overflowX/Y.
+  // Supply the axis values a browser CSSOM reports for these layout fixtures.
+  const computedStyle = window.getComputedStyle.bind(window);
+  window.getComputedStyle = (el) => {
+    const style = computedStyle(el);
+    return new Proxy(style, { get(target, property) {
+      if ((property === "overflowX" || property === "overflowY") &&
+          el.style.overflow && !el.style[property]) return el.style.overflow;
+      return target[property];
+    } });
+  };
+
+  window.Element.prototype.checkVisibility = function (settings = {}) {
+    if (["hidden", "collapse"].includes(window.getComputedStyle(this).visibility)) return false;
     for (let el = this; el && el.nodeType === 1; el = el.parentElement) {
       if (el.hasAttribute("hidden") || el.getAttribute("aria-hidden") === "true") return false;
       if (el.style && el.style.display === "none") return false;
+      if (settings.checkOpacity && el.style.opacity === "0") return false;
+      if (el.tagName === "DETAILS" && !el.hasAttribute("open") && this !== el &&
+          !(el.querySelector("summary") && el.querySelector("summary").contains(this))) return false;
     }
     return true;
   };
@@ -30,17 +46,38 @@ function makeEnv(html, options = {}) {
   if (options.innerHeight !== undefined) {
     Object.defineProperty(window, "innerHeight", { value: options.innerHeight, configurable: true });
   }
-  if (options.layout) {
-    window.Element.prototype.getBoundingClientRect = function () {
-      const rawTop = this.getAttribute && this.getAttribute("data-top");
-      if (rawTop === null || rawTop === undefined) {
-        return { top: 0, bottom: 0, left: 0, right: 100, width: 100, height: 0, x: 0, y: 0 };
-      }
-      const top = Number(rawTop);
-      const height = Number(this.getAttribute("data-height") || 40);
-      return { top, bottom: top + height, left: 0, right: 100, width: 100, height, x: 0, y: top };
-    };
+  // jsdom has no layout engine. Model browser-reported geometry, including
+  // non-bubbling scroll changes, without injecting helpers into production code.
+  window.Element.prototype.getBoundingClientRect = function () {
+    let top = Number(this.getAttribute("data-top") || 0);
+    let left = Number(this.getAttribute("data-left") || 0);
+    for (let ancestor = this.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      top -= ancestor.scrollTop;
+      left -= ancestor.scrollLeft;
+    }
+    const height = Number(this.getAttribute("data-height") || 40);
+    const width = Number(this.getAttribute("data-width") || 100);
+    return { top, bottom: top + height, left, right: left + width, width, height, x: left, y: top };
+  };
+  window.Element.prototype.getClientRects = function () {
+    return this.checkVisibility ? (this.checkVisibility({ checkOpacity: true }) ? [this.getBoundingClientRect()] : []) :
+      (this.style.display === "none" ? [] : [this.getBoundingClientRect()]);
+  };
+  for (const [property, attribute, fallback] of [
+    ["clientWidth", "data-client-width", "data-width"], ["clientHeight", "data-client-height", "data-height"],
+    ["offsetWidth", "data-width", "data-width"], ["offsetHeight", "data-height", "data-height"],
+    ["clientLeft", "data-client-left", null], ["clientTop", "data-client-top", null]
+  ]) {
+    Object.defineProperty(window.Element.prototype, property, { configurable: true, get() {
+      return Number(this.getAttribute(attribute) ?? (fallback ? this.getAttribute(fallback) : null) ??
+        (property.endsWith("Width") ? 100 : property.endsWith("Height") ? 40 : 0));
+    } });
   }
+  window.Range.prototype.getClientRects = function () {
+    if (options.textRects) return options.textRects(this.startContainer);
+    return this.startContainer.parentElement.getClientRects();
+  };
+  if (options.visibilityFallback) delete window.Element.prototype.checkVisibility;
 
   window.eval(CONFIG_JS);
   window.LOCAL_AI_CONFIG.dynamicTranslateEnabled = options.dynamic !== false;
@@ -49,6 +86,7 @@ function makeEnv(html, options = {}) {
   const listeners = [];
   const requests = [];
   const pending = [];
+  const progressEvents = [];
   let autoRespond = options.autoRespond !== false;
   let responseFor = () => undefined;
   const logs = [];
@@ -77,6 +115,7 @@ function makeEnv(html, options = {}) {
   window.chrome = {
     runtime: {
       sendMessage(msg) {
+        if (msg && msg.type === "TRANSLATION_PROGRESS") progressEvents.push(msg.progress);
         if (!msg || msg.type !== "TRANSLATE_BATCH") return Promise.resolve(undefined);
 
         let resolveRequest;
@@ -124,6 +163,7 @@ function makeEnv(html, options = {}) {
     document,
     requests,
     pending,
+    progressEvents,
     logs,
     send(msg) {
       return new Promise((resolve) => latestListener()(msg, {}, resolve));
@@ -201,6 +241,288 @@ async function scenario(name, run) {
 }
 
 (async () => {
+  await scenario("B13 sticky sidebar sends visible text and catches non-bubbling container scroll", async () => {
+    const env = makeEnv('<main><p>Ordinary document content.</p></main>' +
+      '<aside style="position:sticky;top:0"><nav role="navigation" id="scroller" style="overflow-y:auto" data-top="50" data-height="180">' +
+      '<ul><li data-top="80"><a id="guide" href="/guide" target="_blank">Grammar and types</a></li>' +
+      '<li data-top="180">Partially visible sidebar item</li>' +
+      '<li id="later" data-top="300">Functions and iteration</li></ul></nav></aside>', { layout: true, innerHeight: 600 });
+    // The browser reports the inline link at the same position as its list item.
+    env.document.getElementById("guide").setAttribute("data-top", "80");
+    const scroller = env.document.getElementById("scroller");
+    scroller.dispatchEvent(new env.window.Event("scroll"));
+    await wait(30);
+    assert.strictEqual(env.requests.length, 0, "scroll does not translate before user activation");
+    await env.translate();
+    await wait(60);
+    assert.deepStrictEqual(env.sentTexts().sort(), [
+      "Ordinary document content.", "Grammar and types", "Partially visible sidebar item"
+    ].sort());
+    const completed = env.document.getElementById("guide").parentElement.querySelector(".local-ai-translation");
+    assert(completed, "visible navigation is translated via normal anchor insertion");
+    const before = env.requests.length;
+    scroller.scrollTop = 200;
+    scroller.dispatchEvent(new env.window.Event("scroll", { bubbles: false }));
+    assert(await pollUntil(() => env.sentTexts().includes("Functions and iteration")), "captured container scroll triggers catch-up without a DOM mutation");
+    assert(await pollUntil(() => env.translations().length === 4));
+    assert.strictEqual(env.requests.length, before + 1);
+    assert.strictEqual(env.document.getElementById("guide").parentElement.querySelector(".local-ai-translation"), completed,
+      "scrolling a completed source out of view preserves its translation identity");
+    assert.strictEqual(env.document.getElementById("guide").getAttribute("href"), "/guide");
+    assert.strictEqual(env.document.getElementById("guide").getAttribute("target"), "_blank");
+    scroller.scrollTop = 0;
+    scroller.dispatchEvent(new env.window.Event("scroll"));
+    await wait(DEBOUNCE + 100);
+    assert.strictEqual(env.requests.length, before + 1, "returning to completed items does not resend them");
+    await env.restore();
+    const stopped = env.requests.length;
+    scroller.scrollTop = 200;
+    scroller.dispatchEvent(new env.window.Event("scroll"));
+    await wait(DEBOUNCE + 100);
+    assert.strictEqual(env.requests.length, stopped, "Restore removes the scroll listener");
+    await env.translate();
+    scroller.scrollTop = 0;
+    scroller.dispatchEvent(new env.window.Event("scroll"));
+    assert(await pollUntil(() => env.translations().includes("【译】Grammar and types")), "Translate re-arms scroll catch-up and reuses cache");
+    assert.strictEqual(env.requests.length, stopped);
+    env.dom.window.close();
+  });
+
+  await scenario("B13 intersects every clipping client box by axis and the document viewport", async () => {
+    const env = makeEnv('<main>' +
+      '<div style="overflow:hidden" data-top="100" data-left="20" data-width="200" data-height="150" data-client-left="5" data-client-top="5" data-client-width="180" data-client-height="130">' +
+      '<div style="overflow-y:scroll" data-top="80" data-height="220" data-width="300">' +
+      '<p data-top="120" data-left="50">Visible nested ordinary text</p>' +
+      '<p data-top="80" data-left="50" data-height="20">Clipped by outer ancestor</p>' +
+      '<p data-top="180" data-left="210" data-width="10">Clipped by horizontal client box</p>' +
+      '<p data-top="170" data-left="198" data-width="20">Partly visible on horizontal edge</p>' +
+      '<p data-top="235" data-left="50">Touching client edge has no area</p>' +
+      '</div></div>' +
+      '<div style="overflow:clip" data-top="50" data-height="50"><p data-top="110">Clipped shorthand text</p></div>' +
+      '<div style="overflow-x:clip;overflow-y:visible" data-width="200" data-height="20"><p data-top="300">Visible outside un-clipped axis</p></div>' +
+      '<div style="overflow:auto" data-top="500" data-height="200"><p data-top="650">Outside document viewport</p></div>' +
+      '<div style="overflow:hidden" data-height="60"><p data-top="-20" data-height="40">Partial viewport intersection</p></div>' +
+      '<div style="overflow:hidden;display:contents"><p data-top="400">Display contents does not clip</p></div>' +
+      '<p data-top="1600">Offscreen document body stays eligible</p></main>', { layout: true, innerHeight: 600, dynamic: false });
+    await env.translate();
+    assert.deepStrictEqual(env.sentTexts().sort(), [
+      "Visible nested ordinary text", "Partly visible on horizontal edge", "Visible outside un-clipped axis",
+      "Partial viewport intersection", "Display contents does not clip", "Offscreen document body stays eligible"
+    ].sort(), "nested visibility differs from viewport-priority ordering for ordinary document text");
+    env.dom.window.close();
+  });
+
+  await scenario("B13 navigation and fixed sidebar need viewport intersection even without overflow", async () => {
+    const env = makeEnv('<aside style="position:fixed"><p data-top="20">Fixed sidebar text</p>' +
+      '<p data-top="900">Offscreen fixed sidebar text</p></aside>' +
+      '<div role="navigation"><p data-top="40">ARIA navigation text</p><p data-left="2000">Offscreen horizontal navigation text</p></div>' +
+      '<nav hidden><p>Hidden navigation text</p></nav>' +
+      '<aside aria-hidden="true"><p>ARIA hidden sidebar text</p></aside>', { layout: true, dynamic: false });
+    await env.translate();
+    assert.deepStrictEqual(env.sentTexts().sort(), ["Fixed sidebar text", "ARIA navigation text"].sort());
+    env.dom.window.close();
+  });
+
+  await scenario("B13 BR range geometry excludes clipped inline and catches exposed lines and dynamic content", async () => {
+    const positions = { "Visible first BR line.": 80, "Clipped second BR line.": 280 };
+    const env = makeEnv('<div id="scroller" style="overflow:auto" data-top="50" data-height="130">' +
+      '<div id="lines" data-top="50" data-height="400">Visible first BR line.<br>Clipped second BR line.</div>' +
+      '<p data-top="80" data-height="300"><span data-top="100">Visible aggregate words.</span>' +
+      '<span data-top="230">Initially clipped aggregate words.</span><span hidden>Hidden inline secret.</span></p></div>', {
+      layout: true,
+      textRects(node) {
+        const top = positions[node.nodeValue];
+        if (top === undefined) return node.parentElement.getClientRects();
+        const offset = node.ownerDocument.getElementById("scroller").scrollTop;
+        return [{ top: top - offset, bottom: top - offset + 25, left: 10, right: 90 }];
+      }
+    });
+    await env.translate();
+    assert.deepStrictEqual(env.sentTexts().sort(), ["Visible first BR line.", "Visible aggregate words."].sort(),
+      "text range, rather than the shared BR container rect, determines line eligibility");
+    const scroller = env.document.getElementById("scroller");
+    scroller.scrollTop = 170;
+    scroller.dispatchEvent(new env.window.Event("scroll"));
+    assert(await pollUntil(() => env.translations().includes("【译】Clipped second BR line.")));
+    assert(await pollUntil(() => env.translations().includes("【译】Initially clipped aggregate words.")),
+      "newly exposed inline source refreshes an aggregate owned by the same anchor");
+    assert.strictEqual(env.sentTexts().filter(text => text === "Visible first BR line.").length, 1);
+    assert(!env.sentTexts().some(text => text.includes("Hidden inline secret")));
+    const added = env.document.createElement("p");
+    added.setAttribute("data-top", "260");
+    added.textContent = "Dynamic nested container content.";
+    scroller.appendChild(added);
+    assert(await pollUntil(() => env.translations().includes("【译】Dynamic nested container content.")));
+    await env.restore();
+    assert.strictEqual(env.document.getElementById("lines").innerHTML, "Visible first BR line.<br>Clipped second BR line.");
+    env.dom.window.close();
+  });
+
+  await scenario("B13 nested privacy boundaries survive native and fallback visibility and explicit selection", async () => {
+    for (const visibilityFallback of [false, true]) {
+      const env = makeEnv('<nav style="overflow:auto" data-height="500">' +
+        '<p>Visible words <span style="visibility:hidden">Visibility hidden secret</span>' +
+        '<span style="display:none">Display hidden secret</span><span style="opacity:0">Opacity hidden secret</span> remain readable.</p>' +
+        '<div style="opacity:0"><p>Ancestor opacity secret</p></div>' +
+        '<div aria-hidden="true"><p>ARIA hidden secret</p></div><p hidden>Hidden attribute secret</p>' +
+        '<div contenteditable="true"><p>Editable draft secret</p></div><div contenteditable="plaintext-only">Plaintext editor secret</div>' +
+        '<pre>Preformatted code secret</pre><code>Inline code secret</code>' +
+        '<div>Visible BR words <span style="visibility:hidden">BR hidden secret</span><br>Visible second line.</div></nav>',
+      { visibilityFallback, dynamic: false });
+      await env.translate();
+      assert.deepStrictEqual(env.sentTexts().sort(), ["Visible words remain readable.", "Visible BR words", "Visible second line."].sort());
+      await env.send({ type: "TRANSLATE_SELECTION", selectionText: "Editable draft secret" });
+      assert(env.document.querySelector(".local-ai-selection-card").textContent.includes("【译】Editable draft secret"));
+      await env.restore();
+      env.document.designMode = "on";
+      const before = env.requests.length;
+      await env.translate();
+      assert.strictEqual(env.requests.length, before, "designMode still excludes the whole nested page");
+      env.dom.window.close();
+    }
+    const collapsed = makeEnv('<nav><details><summary>Visible collapsed heading</summary><p>Collapsed secret content</p></details></nav>', { dynamic: false });
+    await collapsed.translate();
+    assert.deepStrictEqual(collapsed.sentTexts(), ["Visible collapsed heading"]);
+    collapsed.dom.window.close();
+  });
+
+  await scenario("ordinary multi-record anchor preserves partial retry and interleaved source order", async () => {
+    const env = makeEnv('<main><p id="source"><span>Alpha original segment.</span> <strong>Bravo original segment.</strong></p></main>',
+      { config: { recordCharLimit: 25 } });
+    env.setResponseFor((request) => request.index === 0 ? {
+      ok: true, results: [{ id: request.msg.items[0].id, translation: "中文 A" }]
+    } : undefined);
+    const first = await env.translate();
+    assert.strictEqual(first.translated, 1);
+    assert.strictEqual(first.failed, 1);
+    assert.strictEqual((await env.status()).status, "partial");
+    await wait(DEBOUNCE + 100);
+    assert.strictEqual(env.requests.length, 1, "catch-up must not retry the failed sibling segment");
+    assert(!env.document.getElementById("source").hasAttribute("data-local-ai-source"));
+    await env.translate();
+    assert.deepStrictEqual(env.requestTexts(env.requests[1]), ["Bravo original segment."]);
+    assert.strictEqual((await env.status()).status, "watching");
+    const p = env.document.getElementById("source");
+    const a = p.querySelector("span").firstChild;
+    const b = p.querySelector("strong").firstChild;
+    assert.strictEqual(a.nextSibling.textContent, "中文 A");
+    assert.strictEqual(b.nextSibling.textContent, "【译】Bravo original segment.");
+    assert(a.nextSibling.compareDocumentPosition(b) & env.window.Node.DOCUMENT_POSITION_FOLLOWING);
+    await env.restore();
+    assert.strictEqual(p.textContent, "Alpha original segment. Bravo original segment.");
+    await env.translate();
+    assert.strictEqual(env.requests.length, 2, "both successful segments remain reusable from cache");
+    assert.deepStrictEqual(env.translations(), ["中文 A", "【译】Bravo original segment."]);
+    env.dom.window.close();
+  });
+
+  await scenario("source replacement discards in-flight output and invalidates completed text and BR records", async () => {
+    const env = makeEnv('<main><p id="source">Alpha source before update.</p><div id="lines">First BR source.<br>Second BR source.</div></main>',
+      { autoRespond: false });
+    const run = env.translate();
+    assert(await pollUntil(() => env.pending.length === 1));
+    const p = env.document.getElementById("source");
+    p.textContent = "Bravo replacement source.";
+    env.resolveRequest(env.pending[0]);
+    await run;
+    assert(!env.translations().some((text) => text.includes("Alpha source")));
+    assert(await pollUntil(() => env.pending.length === 1), "catch-up recollects the replacement source");
+    assert.deepStrictEqual(env.requestTexts(env.pending[0]), ["Bravo replacement source."]);
+    env.resolveRequest(env.pending[0]);
+    assert(await pollUntil(() => env.translations().length === 3));
+    p.textContent = "Charlie updated source.";
+    await wait(0);
+    assert(!env.translations().some((text) => text.includes("Bravo replacement")), "childList replacement removes old sibling translation");
+    assert(!p.hasAttribute("data-local-ai-source"));
+    assert(await pollUntil(() => env.pending.length === 1));
+    env.resolveRequest(env.pending[0]);
+    assert(await pollUntil(() => env.translations().some((text) => text.includes("Charlie updated"))));
+    p.firstChild.nodeValue = "Delta character data update.";
+    const lines = env.document.getElementById("lines");
+    lines.firstChild.nodeValue = "Changed first BR source.";
+    await wait(0);
+    assert(!env.translations().some((text) => text.includes("Charlie updated") || text.includes("First BR source")));
+    assert(await pollUntil(() => env.pending.length === 1));
+    assert.deepStrictEqual(env.requestTexts(env.pending[0]).sort(), ["Delta character data update.", "Changed first BR source."].sort());
+    env.resolveRequest(env.pending[0]);
+    assert(await pollUntil(() => env.translations().length === 3));
+    await wait(DEBOUNCE + 100);
+    assert.strictEqual(env.requests.length, 4, "plugin mutations do not create a translation feedback loop");
+    env.dom.window.close();
+  });
+
+  await scenario("rescans reveal hidden content without sending hidden inline or editable text", async () => {
+    const env = makeEnv('<main><p>Visible words <span id="inline-reveal" style="display:none">Revealed inline words.</span><span>stay grouped.</span></p>' +
+      '<p id="expand" style="display:none">Expanded English paragraph.</p>' +
+      '<div contenteditable="true"><p>Editable draft secret.</p><p contenteditable="false">Read only island.</p></div>' +
+      '<div contenteditable="plaintext-only">Plaintext editor secret.</div>' +
+      '<div>Visible BR words <span hidden>hidden BR secret</span><br>Second visible line.</div></main>');
+    await env.translate();
+    assert(env.sentTexts().includes("Visible words stay grouped."));
+    assert(env.sentTexts().includes("Read only island."));
+    assert(!env.sentTexts().some((text) => /secret|Expanded|Revealed/.test(text)));
+    env.document.getElementById("expand").style.display = "block";
+    env.document.getElementById("inline-reveal").style.display = "inline";
+    assert(await pollUntil(() => env.sentTexts().includes("Expanded English paragraph.")));
+    assert(env.sentTexts().includes("Visible words Revealed inline words. stay grouped."), "newly visible inline content invalidates the earlier aggregate");
+    await env.send({ type: "TRANSLATE_SELECTION", selectionText: "Editable draft secret." });
+    assert(env.document.querySelector(".local-ai-selection-card"), "explicit editable selection still works");
+    await env.restore();
+    env.document.designMode = "on";
+    const before = env.requests.length;
+    await env.translate();
+    assert.strictEqual(env.requests.length, before, "designMode whole-page editing is excluded");
+    assert.strictEqual(env.translations().length, 0);
+    env.dom.window.close();
+  });
+
+  await scenario("BR segment source additions invalidate both in-flight and completed translations", async () => {
+    const env = makeEnv('<div id="article"><strong>Original BR segment.</strong><br>Stable following segment.</div>',
+      { autoRespond: false });
+    const article = env.document.getElementById("article");
+    const first = env.translate();
+    assert(await pollUntil(() => env.pending.length === 1));
+    article.insertBefore(env.document.createTextNode("New words in the same segment."), article.querySelector("br"));
+    env.resolveRequest(env.pending[0]);
+    await first;
+    assert.deepStrictEqual(env.translations(), ["【译】Stable following segment."]);
+    assert(await pollUntil(() => env.pending.length === 1));
+    assert.deepStrictEqual(env.requestTexts(env.pending[0]), ["Original BR segment. New words in the same segment."]);
+    env.resolveRequest(env.pending[0]);
+    assert(await pollUntil(() => env.translations().length === 2));
+    article.querySelector("strong").appendChild(env.document.createTextNode("Added inside the original element."));
+    await wait(0);
+    assert.deepStrictEqual(env.translations(), ["【译】Stable following segment."]);
+    assert(await pollUntil(() => env.pending.length === 1));
+    assert.deepStrictEqual(env.requestTexts(env.pending[0]),
+      ["Original BR segment. Added inside the original element. New words in the same segment."]);
+    env.resolveRequest(env.pending[0]);
+    assert(await pollUntil(() => env.translations().length === 2));
+    env.dom.window.close();
+  });
+
+  await scenario("malformed response IDs stay missing and cannot poison cached results", async () => {
+    const env = makeEnv(pageWithTexts(["Duplicate ID source", "Valid source", "Null ID source"]), { dynamic: false });
+    env.setResponseFor((request) => request.index === 0 ? { ok: true, results: [
+      { id: request.msg.items[0].id, translation: "first duplicate" },
+      { id: request.msg.items[1].id, translation: "有效译文" },
+      { id: request.msg.items[0].id, translation: "second duplicate" },
+      { id: null, translation: "null poison" },
+      { id: String(request.msg.items[2].id), translation: "string poison" },
+      { id: 999, translation: "unexpected poison" }
+    ] } : undefined);
+    const first = await env.translate();
+    assert.strictEqual(first.failed, 2);
+    assert.deepStrictEqual(env.translations(), ["有效译文"]);
+    await env.translate();
+    assert.deepStrictEqual(env.requestTexts(env.requests[1]).sort(), ["Duplicate ID source", "Null ID source"].sort());
+    await env.restore();
+    await env.translate();
+    assert.strictEqual(env.requests.length, 2);
+    assert(!env.translations().some((text) => /poison|duplicate/.test(text)));
+    env.dom.window.close();
+  });
+
   await scenario("translation extracts useful main/footer text, preserves DOM, deduplicates, and restores", async () => {
     const env = makeEnv(`<!doctype html><html><head><title>test</title></head><body>
       <main id="main">
@@ -216,14 +538,15 @@ async function scenario(name, run) {
     </body></html>`);
 
     const result = await env.translate();
-    assert.strictEqual(result.translated, 7, "records include grouped inline text, three duplicate records, and footer records");
+    assert.strictEqual(result.translated, 9, "records include visible navigation, grouped inline text, duplicates, and footer records");
     assert.deepStrictEqual(env.sentTexts().sort(), [
-      "Welcome to this great workplace today.", "Save job", "Browse jobs", "Job seekers", "Help centre"
+      "Welcome to this great workplace today.", "Save job", "Browse jobs", "Job seekers", "Help centre",
+      "Primary navigation", "Sidebar advertisement"
     ].sort(), "same-text records share one model item");
-    assert.strictEqual(env.translations().length, 7);
+    assert.strictEqual(env.translations().length, 9);
     assert(env.translations().includes("【译】Welcome to this great workplace today."));
     assert(env.translations().includes("【译】Job seekers"));
-    for (const excluded of ["Primary navigation", "Sidebar advertisement", "const hiddenCode", "Hidden page content", "Screen reader hidden content"]) {
+    for (const excluded of ["const hiddenCode", "Hidden page content", "Screen reader hidden content"]) {
       assert(!env.sentTexts().some((text) => text.includes(excluded)), excluded + " should be filtered");
     }
 
@@ -238,7 +561,7 @@ async function scenario(name, run) {
     assert.strictEqual(footerLink.getAttribute("rel"), "noreferrer");
 
     const restored = await env.restore();
-    assert.strictEqual(restored.removed, 7);
+    assert.strictEqual(restored.removed, 9);
     assert.strictEqual(env.document.querySelectorAll(".local-ai-translation").length, 0);
     assert.strictEqual(env.document.querySelectorAll("[data-local-ai-source]").length, 0);
     assert.strictEqual(env.document.getElementById("inline").textContent, "Welcome to this great workplace today.");
@@ -380,12 +703,13 @@ async function scenario(name, run) {
 
   await scenario("initial stale response cannot replace the current DOM or cached translation", async () => {
     const env = makeEnv(pageWithTexts(["Race condition role"]), { autoRespond: false });
-    const staleRun = env.translate();
+    const staleRun = env.send({ type: "TRANSLATE_PAGE", operationId: "popup:old" });
     assert(await pollUntil(() => env.pending.length === 1));
     const staleRequest = env.pending[0];
 
-    await env.restore();
-    const currentRun = env.translate();
+    await env.send({ type: "RESTORE_PAGE", operationId: "popup:restore" });
+    const progressBoundary = env.progressEvents.length;
+    const currentRun = env.send({ type: "TRANSLATE_PAGE", operationId: "popup:new" });
     assert(await pollUntil(() => env.pending.length === 2));
     const currentRequest = env.pending.find((request) => request !== staleRequest);
     env.resolveRequest(currentRequest, "CURRENT");
@@ -395,6 +719,11 @@ async function scenario(name, run) {
 
     assert.deepStrictEqual(env.translations(), ["【CURRENT】Race condition role"]);
     assert.strictEqual((await env.status()).status, "watching");
+    const state = await env.status();
+    assert.strictEqual(state.operationId, "popup:new");
+    assert(env.progressEvents.slice(progressBoundary).every((progress) =>
+      progress.operationId === "popup:new" && progress.sessionGeneration === state.sessionGeneration),
+      "late task output cannot publish progress with the new task identity");
     await env.restore();
     const sentBeforeHit = env.requests.length;
     const cached = await env.translate();
@@ -497,11 +826,13 @@ async function scenario(name, run) {
     failedEnv.setResponseFor(() => {
       if (!failFirst) return undefined;
       failFirst = false;
-      return { reject: new Error("simulated HTTP failure") };
+      return { reject: new Error("PRIVATE_SERVICE_ERROR_DO_NOT_EXPOSE") };
     });
     const first = await failedEnv.translate();
     assert.strictEqual(first.translated, 0);
     assert.strictEqual(first.failed, 1);
+    assert(!JSON.stringify(first).includes("PRIVATE_SERVICE_ERROR"));
+    assert(!failedEnv.logs.join(" ").includes("PRIVATE_SERVICE_ERROR"), "raw runtime errors stay out of content logs and UI responses");
     await failedEnv.restore();
     const beforeRetry = failedEnv.requests.length;
     const retry = await failedEnv.translate();
@@ -650,9 +981,8 @@ async function scenario(name, run) {
     env.setAutoRespond(false);
     const pageRun = env.translate();
     assert(await pollUntil(() => env.pending.length === 1));
-    // A page can move a BR while Ollama is answering. The saved source node
-    // still defines where its translation must appear.
-    article.insertBefore(sourceNodes[1].nextSibling, sourceNodes[1]);
+    // Retain source boundaries while the request is in flight. Changes to a
+    // segment's source identity are separately covered by the stale-DOM cases.
     const originalHtml = article.innerHTML;
     env.resolveRequest(env.pending[0], "译");
     await pageRun;
