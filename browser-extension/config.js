@@ -5,40 +5,23 @@
  */
 (function () {
   const CONFIG = {
-    // Ollama 本地服务地址
-    ollamaBaseUrl: "http://127.0.0.1:11434",
-    // 使用的本地模型
-    model: "qwen3.5:4b",
-
-    // 当前固定目标语言（与 background.js 中的固定翻译规则保持一致）。
-    targetLanguage: "Simplified Chinese (zh-CN)",
-    // 若 background.js 的 system prompt / 翻译规则改变，必须同步提升此版本。
-    translationPromptVersion: "v1",
+    runtimeBaseUrl: "http://127.0.0.1:8765",
+    targetLanguage: "zh-CN",
     // content script 页面生命周期内缓存的最大条目数。
     translationCacheMaxEntries: 500,
 
-    // 关闭 thinking / reasoning。翻译任务不需要推理链。
-    think: false,
-
-    // 翻译请求参数
-    temperature: 0,
-    top_p: 0.9,
-    num_predict: 2048,
-    // 显式限定上下文，避免 Ollama 使用默认值导致内存/截断问题
-    num_ctx: 8192,
-    // 模型加载后保持驻留，避免频繁 unload/reload（Ollama 0.34+ 支持）
-    keepAlive: "30m",
-
-    // 单次翻译请求超时（毫秒）。首次请求可能触发 Ollama 加载模型，不宜过短。
-    requestTimeoutMs: 90000,
-    // 单个批次最多额外重试次数（仅针对可重试错误）
-    maxRetries: 1,
-
-    // 每批最多发送的字符数。本机 context 8K，需留出
-    // system prompt / JSON 外壳 / 输出空间，故保留安全余量。
-    // RTX 5060 8GB + qwen3.5:9b 实测：5000 chars 在 num_predict 2048 下
-    // 存在输出截断风险，2800 为当前稳定默认值（接近实测稳定的 ~2500 区间）。
     batchCharLimit: 2800,
+    batchItemLimit: 32,
+    batchUtf8ByteLimit: 4096,
+    // Browser admission limits verified against the stable Runtime Single contract.
+    singleTextCharLimit: 4000,
+    singleTextUtf8ByteLimit: 5632,
+    runtimeRequestTimeoutMs: 8000,
+    runtimeTaskDeadlineMs: 190000,
+    runtimePollIntervalMs: 750,
+    runtimeMaxPolls: 260,
+    runtimeGetRetryLimit: 2,
+    runtimeResponseByteLimit: 65536,
 
     // ---- Viewport First (v0.1.2) ----
     // 首批目标字符数：比后续批次小，让当前视口尽快出现中文。
@@ -56,10 +39,8 @@
     // mutation 时逐个触发模型请求。
     mutationDebounceMs: 750,
 
-    // 单个文本块超过该长度则单独成批，避免过长的单条。
-    singleTextLimit: 5000,
-    // 超过该长度的单条直接跳过（防止一个超长节点拖垮整页）
-    hardTextLimit: 12000,
+    // Selection UX limit; background validates characters AND UTF-8 bytes.
+    hardTextLimit: 4000,
     // 跳过长度小于该值的文本块（仅作下限，不做主要过滤依据）
     minTextLength: 2,
     // 多个小文本片段合并成一条 record 的上限（如 "Posted" + "4d ago"）

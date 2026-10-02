@@ -48,3 +48,6 @@ yarn-error.log*
 tmp/
 temp/
 *.tmp
+
+# Isolated Runtime / Chrome acceptance artifacts and private native smoke state
+.verification/

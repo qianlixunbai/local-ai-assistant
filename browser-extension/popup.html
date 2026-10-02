@@ -13,27 +13,43 @@
 
   <section class="info">
     <div class="row">
-      <span class="label">Ollama</span>
+      <span class="label">Runtime</span>
       <span class="value">
-        <span class="dot" id="ollamaDot"></span>
-        <span id="ollamaStatus">未检测</span>
+        <span class="dot" id="runtimeDot"></span>
+        <span id="runtimeStatus">未检测</span>
       </span>
     </div>
     <div class="row">
-      <span class="label">模型</span>
+      <span class="label">Translation</span>
       <span class="value">
-        <span class="dot" id="modelDot"></span>
-        <span id="modelStatus">未检测</span>
+        <span class="dot" id="translationDot"></span>
+        <span id="translationStatus">未检测</span>
       </span>
     </div>
     <div class="row">
-      <span class="label">当前模型</span>
-      <span class="value" id="modelName">—</span>
+      <span class="label">Pairing</span>
+      <span class="value" id="pairingStatus">未配对</span>
     </div>
   </section>
 
+  <section class="info pairing">
+    <label for="extensionOrigin">Extension Origin</label>
+    <input id="extensionOrigin" readonly aria-label="Extension Origin" />
+    <button id="btnCopyOrigin" class="btn btn-secondary">Copy Origin</button>
+    <p class="pairing-help">在 Windows Assistant → Pair Browser 中粘贴 Origin，明确创建一次性配对。</p>
+    <form id="pairingForm" autocomplete="off">
+      <label for="pairingId">Pairing ID</label>
+      <input id="pairingId" autocomplete="off" maxlength="36" spellcheck="false" />
+      <label for="pairingSecret">One-time Secret</label>
+      <input id="pairingSecret" type="password" autocomplete="off" maxlength="43" spellcheck="false" />
+      <button id="btnPair" type="submit" class="btn btn-secondary">Pair</button>
+    </form>
+    <button id="btnForget" class="btn btn-secondary" hidden>Forget local pairing</button>
+    <p class="pairing-help">Forget 仅删除本地配对。Server revoke 请在 Windows Assistant → Paired Browsers 中执行。</p>
+  </section>
+
   <section class="actions">
-    <button id="btnTranslate" class="btn btn-primary">翻译当前页面</button>
+    <button id="btnTranslate" class="btn btn-primary" disabled>翻译当前页面</button>
     <div class="sub-actions">
       <button id="btnTest" class="btn btn-secondary">检测连接</button>
       <button id="btnRestore" class="btn btn-secondary">恢复原文</button>

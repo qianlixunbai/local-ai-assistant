@@ -1,12 +1,31 @@
 # Development Status
 
+## 当前版本 v0.5.0 — M2B-2B
+
+**PARTIAL / AWAITING REAL CHROME ACCEPTANCE**。开发分支 `m2b2b-runtime-migration`，基于 clean v0.4.1 `75bede1`。
+Runtime source / GitHub main baseline `25dc1df` 已只读核对；本轮不修改 Personal AI Workspace。
+
+当前架构：Chrome Extension → authenticated Personal AI Runtime :8765 → Translate / Batch → Shared TaskManager → local Provider。
+Browser Provider 配置、warmup、直连权限和 fallback 已删除；版本 manifest / package / lock / PING 均为 0.5.0。
+显式 pairing、trusted-only local credential、受控 readiness、严格 task submit/poll/result、防重试 POST、Batch + Single budget 已实现。
+DOM / dynamic / Restore / Selection / frame / cache / popup 生命周期保持并通过自动回归。
+
+自动 tests 与静态 audit、真实 Runtime smoke、真实 Chrome 的当前证据和未完成项，以 [M2B-2B report](M2B-2B-RUNTIME-MIGRATION-REPORT.md) 为准。
+真实 Chrome 154 已复现：POST exchange 成功，authenticated readiness GET 自然不带 Origin，Runtime `25dc1df` 返回 401。
+明确 `mode: cors` 仍复现；不伪造 headers，不修改 Runtime 安全边界。Chrome integration 当前 FAIL / BLOCKED。
+真实 Windows Assistant 配对/撤销、原生 Selection 菜单、MDN/sidebar/nested scroll/privacy 与 MV3 迁移验收未全部完成前，不声明 CLOSED — GO。
+B11 inline BR layout / B12 mutation debounce starvation 继续 DEFERRED。
+没有 merge / push / tag / Release，也没有 Workspace M2 Final Status Sync。
+
+以下 v0.4.1 与早期条目是历史记录，原本 Chrome → Ollama 的结论保持。
+
 ## Testing Policy
 
 Minimal High-Value Testing：优先用少量完整行为场景覆盖真实用户流程与高风险竞态。
 避免测试实现细节及重复的历史回归；一个场景可以包含多个必要断言。
 新增测试须有明确回归价值，测试数量和覆盖率百分比不是项目目标。
 
-## 版本状态（v0.4.1）
+## 历史版本状态（v0.4.1）
 
 **Result: GO / RELEASED** —— v0.4.1 Stability & Privacy Hotfix；2026-10-01 用户确认真实 Chrome 验收全部通过，进入最终封版。
 manifest / package.json / package-lock.json / content PING 与当前文档版本均为 v0.4.1。

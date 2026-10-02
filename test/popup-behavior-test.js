@@ -17,12 +17,8 @@ function deferred() {
 }
 
 function makePopup(options = {}) {
-  const dom = new JSDOM(`<!doctype html><body>
-    <span id="modelName"></span><span id="ollamaDot"></span><span id="ollamaStatus"></span>
-    <span id="modelDot"></span><span id="modelStatus"></span>
-    <button id="btnTest"></button><button id="btnTranslate"></button><button id="btnRestore"></button>
-    <p id="statusText"></p>
-  </body>`, { url: "chrome-extension://test/popup.html", runScripts: "outside-only" });
+  const dom = new JSDOM(fs.readFileSync(path.resolve(__dirname, "..", "browser-extension", "popup.html"), "utf8"),
+    { url: "chrome-extension://abcdefghijklmnopabcdefghijklmnop/popup.html", runScripts: "outside-only" });
   const { window } = dom;
   Object.defineProperty(window.document, "readyState", { configurable: true, value: "complete" });
 
@@ -39,9 +35,12 @@ function makePopup(options = {}) {
   window.console = { log() {}, warn() {}, error() {} };
   window.chrome = {
     runtime: {
+      id: "abcdefghijklmnopabcdefghijklmnop",
       sendMessage(message) {
         backgroundMessages.push(message);
-        if (message.type === "GET_CONFIG") return Promise.resolve({ ok: true, model: "test-model" });
+        if (message.type === "GET_PAIRING") return Promise.resolve({ ok: true, paired: options.paired !== false, pairing: options.paired === false ? "unpaired" : "paired" });
+        if (message.type === "PAIR") return options.pairResponse ? options.pairResponse(message) : Promise.resolve({ ok: true, paired: true, pairing: "paired" });
+        if (message.type === "FORGET_PAIRING") return Promise.resolve({ ok: true, paired: false, pairing: "unpaired" });
         if (message.type === "ENSURE_CONTENT_SCRIPT") {
           ensureCount += 1;
           const initializedContentPresent = options.ensureOnInit === true;
@@ -53,7 +52,7 @@ function makePopup(options = {}) {
             pendingCheck = deferred();
             return pendingCheck.promise;
           }
-          return Promise.resolve({ ok: true, online: true, available: true, version: "test" });
+          return Promise.resolve(options.readiness || { ok: true, paired: options.paired !== false, pairing: options.paired === false ? "unpaired" : "paired", online: true, available: options.paired !== false });
         }
         return Promise.resolve({ ok: true });
       },
@@ -97,6 +96,7 @@ function makePopup(options = {}) {
     holdConnectionCheck() { holdNextCheck = true; },
     get pendingCheck() { return pendingCheck; },
     byId,
+    window,
     setStatusResult(value) { getStatusResult = value; }
   };
 }
@@ -131,7 +131,7 @@ async function testRestoreCancelsTranslatePreflightAndBProgressIsScoped() {
   assert(popup.tabMessages.every((entry) => entry.options && entry.options.frameId === 0),
     "popup page operations target only the top frame");
 
-  popup.pendingCheck.resolve({ ok: true, online: true, available: true, version: "late" });
+  popup.pendingCheck.resolve({ ok: true, paired: true, pairing: "paired", online: true, available: true });
   await wait(0);
   assert.deepStrictEqual(popup.tabMessages, pageMessagesAfterReplacement,
     "a stale preflight must not continue to GET_STATUS, LAT_RESET, or TRANSLATE_PAGE");
@@ -201,7 +201,38 @@ async function testReopenedPopupTracksExistingPageOperation() {
   console.log("PASS  Restore invalidates stale Translate preflight and progress is scoped to tab/operation/session");
   await testReopenedPopupTracksExistingPageOperation();
   console.log("PASS  a reopened popup follows only the operation reported by GET_STATUS");
-  console.log("\n2/2 popup lifecycle scenarios passed.");
+  const pairing = makePopup({ paired: false, pairResponse: async () => ({ ok: false, kind: "pairingUnknown", error: "配对状态未知，请查看 Paired Browsers。" }) });
+  await pairing.waitFor(() => pairing.backgroundMessages.some(m => m.type === "CHECK_CONNECTION"), "unpaired initialization");
+  assert(pairing.byId("btnTranslate").disabled);
+  assert.strictEqual(pairing.byId("extensionOrigin").value, "chrome-extension://" + pairing.window.chrome.runtime.id);
+  pairing.byId("pairingId").value = "temporary pairing id";
+  pairing.byId("pairingSecret").value = "temporary proof";
+  pairing.byId("pairingForm").dispatchEvent(new pairing.window.Event("submit", { cancelable: true }));
+  assert.strictEqual(pairing.byId("pairingSecret").value, "", "proof cleared before waiting for exchange");
+  await pairing.waitFor(() => pairing.byId("statusText").textContent.includes("状态未知"), "ambiguous exchange UX");
+  assert.strictEqual(pairing.byId("pairingId").value, "");
+  assert.strictEqual(pairing.backgroundMessages.filter(m => m.type === "PAIR").length, 1);
+  assert(!pairing.backgroundMessages.some(m => m.type === "WARMUP"));
+  console.log("PASS  exact Origin, unpaired button, proof clearing and ambiguous exchange UX");
+  const storage = makePopup({ paired: false, pairResponse: async () => ({ ok: false, kind: "storage", error: "Browser credential 未安全保存，请撤销。" }) });
+  await storage.waitFor(() => storage.backgroundMessages.some(m => m.type === "CHECK_CONNECTION"), "storage popup initialization");
+  storage.byId("pairingForm").dispatchEvent(new storage.window.Event("submit", { cancelable: true }));
+  await storage.waitFor(() => storage.byId("statusText").textContent.includes("未安全保存"), "storage failure guidance");
+  assert(storage.byId("btnTranslate").disabled);
+  assert.strictEqual(storage.byId("pairingSecret").value, "");
+  const forget = makePopup();
+  await forget.waitFor(() => !forget.byId("btnForget").hidden, "paired popup");
+  forget.byId("btnForget").click();
+  await forget.waitFor(() => forget.byId("statusText").textContent.includes("不等于 server revoke"), "local Forget UX");
+  assert(forget.byId("btnTranslate").disabled);
+  assert(!forget.backgroundMessages.some(m => m.type === "REVOKE"));
+  console.log("PASS  storage failure fails closed and Forget states server revoke boundary");
+  const invalid = makePopup({ readiness: { ok: true, paired: false, pairing: "invalid", online: true, available: false, reason: "配对凭据已失效，请重新配对。" } });
+  await invalid.waitFor(() => invalid.byId("pairingStatus").textContent.includes("凭据失效"), "revoked UX");
+  assert(invalid.byId("btnTranslate").disabled);
+  assert.strictEqual(invalid.byId("runtimeStatus").textContent, "在线");
+  console.log("PASS  revoked credential disables translation while Runtime stays online");
+  console.log("\n5 popup lifecycle/pairing scenarios passed.");
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

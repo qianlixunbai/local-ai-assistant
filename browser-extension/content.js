@@ -9,7 +9,7 @@
  * 5. 向 popup 推送进度 / 输出本地性能日志
  *
  * 网络请求全部由 background service worker 通过 chrome.runtime messaging
- * 完成，本脚本不包含任何 fetch / Ollama 逻辑。
+ * 完成，本脚本不直接访问 Runtime。
  *
  * 提取策略（v0.1.1）：
  * 不依赖 p/li/h* 等固定标签选择器，而是遍历所有文本节点，因此
@@ -36,6 +36,34 @@
   }
 
   const TAG = "[LAT]";
+  const RUNTIME_ERRORS = Object.freeze({
+    network: "Runtime 离线，请启动 Personal AI Runtime。",
+    unauthorized: "Browser 配对凭据已失效或被撤销，请重新配对。",
+    unpaired: "尚未配对，请先配对 Browser。",
+    unavailable: "Translation 不可用，请检查翻译服务。",
+    busy: "Runtime 繁忙，请稍后重试。",
+    timeout: "翻译超时，请稍后重试。",
+    cancelled: "翻译任务已取消。",
+    invalid: "翻译响应无效，请重试。",
+    unsupported: "翻译输入超出 Runtime 安全预算。",
+    denied: "Runtime 不允许此翻译请求。",
+    missing: "翻译任务已不存在，请显式重试。",
+    storage: "Browser credential 未安全保存，请在 Windows Assistant 撤销后重新配对。",
+    submissionUnknown: "提交结果未知，Runtime 可能已接受任务；不会自动重试。"
+  });
+  function safeRuntimeError(kind) { return RUNTIME_ERRORS[kind] || "本地翻译请求失败，请重试。"; }
+  // Cache reuse must still honor authentication, revoke and Runtime availability.
+  async function checkCacheAccess() {
+    let response;
+    try { response = await chrome.runtime.sendMessage({ type: "CHECK_CONNECTION" }); }
+    catch (_) { const error = new Error(safeRuntimeError("network")); error.kind = "network"; throw error; }
+    if (!response || !response.ok || !response.paired || !response.online || !response.available) {
+      const error = new Error("翻译暂时不可用。");
+      error.kind = response?.pairing === "invalid" ? "unauthorized" : response?.pairing === "unpaired" ? "unpaired" :
+        response?.pairing === "storage" ? "storage" : !response?.online ? "network" : "unavailable";
+      throw error;
+    }
+  }
 
   // 行内元素：可以成为锚点（译文插入其内部），也可以被更外层锚点合并
   const INLINE_TAGS = new Set([
@@ -61,6 +89,8 @@
   let lastError = "";
   // 页面级缓存独立于翻译 session；Restore / LAT_RESET 不清除此 Map。
   const translationCache = new Map();
+  // Learn identities only from successful tasks, independently for Batch and Single.
+  const runtimeIdentities = new Map();
   // 选区翻译使用独立 generation，不改变整页翻译 session 的生命周期。
   let selectionGeneration = 0;
   let selectionCard = null;
@@ -576,6 +606,7 @@
     const batches = [];
     let current = [];
     let currentLen = 0;
+    let currentBytes = 0;
     let limit = firstLimit;
 
     const flush = () => {
@@ -583,22 +614,26 @@
       batches.push(current);
       current = [];
       currentLen = 0;
+      currentBytes = 0;
       limit = CFG.batchCharLimit; // 首批之后恢复常规上限
     };
 
     for (const rec of orderedRecords) {
       const len = rec.text.length;
-      if (len > CFG.singleTextLimit) {
+      const bytes = new TextEncoder().encode(rec.text).length;
+      if (len > CFG.batchCharLimit || bytes > CFG.batchUtf8ByteLimit) {
         flush();
         batches.push([rec]);
         limit = CFG.batchCharLimit;
         continue;
       }
-      if (current.length && currentLen + len > limit) {
+      if (current.length && (currentLen + len > Math.min(limit, CFG.batchCharLimit) ||
+          current.length >= CFG.batchItemLimit || currentBytes + bytes > CFG.batchUtf8ByteLimit)) {
         flush();
       }
       current.push(rec);
       currentLen += len;
+      currentBytes += bytes;
     }
     flush();
     return batches;
@@ -621,6 +656,14 @@
     }
 
     const byId = new Map();
+    const identity = resp.identity;
+    if (!validRuntimeIdentity(identity)) {
+      const error = new Error("翻译响应无效，请重试。");
+      error.kind = "invalid";
+      throw error;
+    }
+    // Metadata is committed only after the caller checks session/selection generation.
+    byId.identity = identity;
     const requested = new Set(items.map((item) => item.id));
     const seen = new Set();
     const duplicates = new Set();
@@ -635,23 +678,47 @@
     return byId;
   }
 
-  /** 精确翻译缓存 key；keep_alive 与 DOM / session 信息不影响翻译结果。 */
+  function translationMode(text) {
+    return text.length > CFG.batchCharLimit || new TextEncoder().encode(text).length > CFG.batchUtf8ByteLimit ? "single" : "batch";
+  }
+  function validRuntimeIdentity(value) {
+    return value && value.profile && value.profile.id === "translate.fast" && value.profile.locality === "LOCAL" &&
+      typeof value.profile.version === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(value.profile.version) &&
+      typeof value.promptVersion === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(value.promptVersion);
+  }
+  function learnRuntimeIdentity(text, identity) {
+    if (!validRuntimeIdentity(identity)) return;
+    const mode = translationMode(text);
+    const previous = runtimeIdentities.get(mode);
+    let changed = false;
+    if (previous && JSON.stringify(previous) !== JSON.stringify(identity)) { translationCache.clear(); changed = true; }
+    // A changed public profile invalidates both modes, even before the other prompt is observed.
+    for (const [other, known] of runtimeIdentities) {
+      if (JSON.stringify(known.profile) !== JSON.stringify(identity.profile)) {
+        translationCache.clear();
+        changed = true;
+        runtimeIdentities.delete(other);
+      }
+    }
+    runtimeIdentities.set(mode, { profile: { ...identity.profile }, promptVersion: identity.promptVersion });
+    return changed;
+  }
+  /** No lookup until the Runtime has supplied this mode's public identity. */
   function translationCacheKey(text) {
+    const identity = runtimeIdentities.get(translationMode(text));
+    if (!identity) return null;
     return JSON.stringify({
       text: normalize(text),
-      model: CFG.model,
       targetLanguage: CFG.targetLanguage,
-      promptVersion: CFG.translationPromptVersion,
-      think: CFG.think,
-      temperature: CFG.temperature,
-      topP: CFG.top_p,
-      numPredict: CFG.num_predict,
-      numCtx: CFG.num_ctx
+      profileId: identity.profile.id,
+      profileVersion: identity.profile.version,
+      promptVersion: identity.promptVersion
     });
   }
 
   /** Cache hit 时提升为最近使用项。 */
   function getCachedTranslation(key) {
+    if (key === null) return null;
     if (!translationCache.has(key)) return null;
     const value = translationCache.get(key);
     translationCache.delete(key);
@@ -661,6 +728,7 @@
 
   /** 只保存成功的非空译文，并按最近使用顺序限制页面缓存容量。 */
   function setCachedTranslation(key, translation) {
+    if (key === null) return;
     if (typeof translation !== "string" || !translation.trim()) return;
     translationCache.delete(key);
     translationCache.set(key, translation.trim());
@@ -674,7 +742,7 @@
    * 先查页面缓存，再将未命中的相同 key 合并为唯一请求项。
    * cachePlan.byId 仅包含当前 batch 的 cache hit；missGroups 用于回填和 fan-out。
    */
-  function prepareCachedBatch(batch) {
+  async function prepareCachedBatch(batch) {
     const byId = new Map();
     const missGroups = new Map();
     let hits = 0;
@@ -690,15 +758,18 @@
       }
 
       misses++;
-      let group = missGroups.get(key);
+      // Same-text fan-out still works before the first identity is known.
+      const groupKey = key || JSON.stringify([normalize(record.text), CFG.targetLanguage, translationMode(record.text)]);
+      let group = missGroups.get(groupKey);
       if (!group) {
         group = { key, records: [] };
-        missGroups.set(key, group);
+        missGroups.set(groupKey, group);
       }
       group.records.push(record);
     });
 
     const requests = Array.from(missGroups.values(), (group) => group.records[0]);
+    if (hits) await checkCacheAccess();
     console.log(
       TAG + " cache: hits=" + hits +
       " misses=" + misses +
@@ -714,6 +785,9 @@
    */
   function resolveCachedBatch(cachePlan, translatedById, generation) {
     if (!isCurrentSession(generation)) return null;
+    if (translatedById && translatedById.identity && cachePlan.requests.length) {
+      if (learnRuntimeIdentity(cachePlan.requests[0].text, translatedById.identity)) cachePlan.byId.clear();
+    }
     const byId = cachePlan.byId;
 
     for (const group of cachePlan.missGroups.values()) {
@@ -724,7 +798,7 @@
       const normalizedTranslation = translation.trim();
       // generation 校验必须位于任何 cache write 之前。
       if (!isCurrentSession(generation)) return null;
-      setCachedTranslation(group.key, normalizedTranslation);
+      setCachedTranslation(translationCacheKey(representative.text), normalizedTranslation);
       group.records.forEach((record) => byId.set(record.id, normalizedTranslation));
     }
 
@@ -916,6 +990,7 @@
     try {
       let translation = getCachedTranslation(key);
       const cached = translation !== null;
+      if (cached) await checkCacheAccess();
       if (!cached) {
         const translatedById = await requestBatch([{ id: 0, text }]);
         // Only the latest selection may cache or render an async result.
@@ -927,7 +1002,8 @@
           throw error;
         }
         if (!isCurrentSelection(generation)) return { ok: false, stale: true };
-        setCachedTranslation(key, translation.trim());
+        learnRuntimeIdentity(text, translatedById.identity);
+        setCachedTranslation(translationCacheKey(text), translation.trim());
       }
 
       if (!isCurrentSelection(generation)) return { ok: false, stale: true };
@@ -937,17 +1013,12 @@
       return { ok: true, cached };
     } catch (error) {
       if (!isCurrentSelection(generation)) return { ok: false, stale: true };
-      const messages = {
-        network: "无法连接本机 Ollama，请确认服务已启动。",
-        model: "本地模型不可用，请确认已安装所需模型。",
-        timeout: "翻译请求超时，请稍后重试。",
-        empty: "未获得译文，请重试。"
-      };
+      const messages = { ...RUNTIME_ERRORS, empty: "未获得译文，请重试。" };
       const friendly = messages[error && error.kind] || "翻译暂时失败，请稍后重试。";
       card.status.textContent = "翻译失败";
       card.body.textContent = friendly;
       placeSelectionCard(card, placement);
-      // Do not log selection text, model output, response payloads, or exception details.
+      // Do not log selection text, translation, response payloads, or exception details.
       console.warn(TAG + " selection translation failed: " + (messages[error && error.kind] ? error.kind : "unknown"));
       return { ok: false, error: friendly };
     }
@@ -1159,18 +1230,14 @@
       // stale 会话（Restore / 新翻译）：立即退出，绝不写入任何状态
       if (!isCurrentSession(myGen) || !watching) break;
 
-      const batch = batches[i].filter((r) => {
-        if (r.text.length > CFG.hardTextLimit) {
-          console.warn(TAG, "跳过超长文本（" + r.text.length + " 字符）");
-          return false;
-        }
-        return true;
-      });
+      // Oversized records are isolated by buildBatches and fail through the normal partial path.
+      const batch = batches[i];
       if (!batch.length) continue;
 
       batch.forEach((r) => setRecordTranslating(r, true));
       try {
-        const cachePlan = prepareCachedBatch(batch);
+        const cachePlan = await prepareCachedBatch(batch);
+        if (!isCurrentSession(myGen) || !watching) break;
         let translatedById = null;
         let requestError = null;
         if (cachePlan.requests.length) {
@@ -1186,7 +1253,10 @@
         }
         const byId = resolveCachedBatch(cachePlan, translatedById, myGen);
         if (!byId) break;
-        if (requestError) console.error(TAG, "动态批次翻译失败:", "request");
+        if (requestError) {
+          console.error(TAG, "动态批次翻译失败:", "request");
+          lastError = safeRuntimeError(requestError.kind);
+        }
         batch.forEach((r) => {
           if (!sourceIsCurrent(r)) { dirty = true; setRecordTranslating(r, false); return; }
           const translation = byId.get(r.id);
@@ -1199,6 +1269,8 @@
           setRecordTranslating(r, false);
         });
       } catch (e) {
+        if (!isCurrentSession(myGen) || !watching) break;
+        lastError = safeRuntimeError(e.kind);
         console.error(TAG, "动态批次翻译失败:", "request");
         failed += batch.length;
         batch.forEach((r) => { failedRecords.push(recordFailureKey(r)); setRecordTranslating(r, false); });
@@ -1231,7 +1303,7 @@
 
 
   function sendProgress(partial) {
-    sessionProgress = Object.assign({}, sessionProgress, partial, { operationId, sessionGeneration });
+    sessionProgress = Object.assign({}, sessionProgress, partial, { operationId, sessionGeneration, error: lastError });
     try {
       const p = chrome.runtime.sendMessage({ type: "TRANSLATION_PROGRESS", progress: sessionProgress });
       // popup 可能已关闭，此时消息端口关闭会 reject，忽略即可
@@ -1308,15 +1380,7 @@
       if (!isCurrentSession(myGen)) break;
       const batch = batches[i];
 
-      const usable = [];
-      batch.forEach((r) => {
-        if (r.text.length > CFG.hardTextLimit) {
-          console.warn(TAG, "跳过超长文本（" + r.text.length + " 字符）");
-          skipped++;
-        } else {
-          usable.push(r);
-        }
-      });
+      const usable = batch;
 
       if (!usable.length) {
         sendProgress({ status: "translating", done: translated, total, batch: i + 1, batches: batches.length });
@@ -1328,7 +1392,8 @@
       const batchChars = usable.reduce((s, r) => s + r.text.length, 0);
       const bt0 = performance.now();
       try {
-        const cachePlan = prepareCachedBatch(usable);
+        const cachePlan = await prepareCachedBatch(usable);
+        if (!isCurrentSession(myGen)) return { ok: false, stale: true, cancelled: true };
         let translatedById = null;
         let requestError = null;
         if (cachePlan.requests.length) {
@@ -1346,7 +1411,7 @@
         if (!byId) return { ok: false, stale: true, cancelled: true };
         if (requestError) {
           console.error(TAG, "批次翻译失败:", "request");
-          lastError = "本地翻译请求失败，请重试。";
+          lastError = safeRuntimeError(requestError.kind);
         }
         usable.forEach((r) => {
           if (!sourceIsCurrent(r)) { dirty = true; setRecordTranslating(r, false); return; }
@@ -1364,7 +1429,7 @@
           return { ok: false, stale: true, cancelled: true };
         }
         console.error(TAG, "批次翻译失败:", "request");
-        lastError = "翻译暂时失败，请稍后重试。";
+        lastError = safeRuntimeError(e.kind);
         failed += usable.length;
         usable.forEach((r) => { failedRecords.push(recordFailureKey(r)); setRecordTranslating(r, false); });
         // 保留已翻译部分，继续后续批次
@@ -1492,7 +1557,7 @@
     } else if (translated > 0) {
       status = "translated";
     }
-    return { ok: true, status, watching, translated, operationId, sessionGeneration,
+    return { ok: true, status, watching, translated, operationId, sessionGeneration, error: partialPending ? lastError : "",
       progress: Object.assign({}, sessionProgress, { operationId, sessionGeneration }) };
   }
 
@@ -1504,7 +1569,7 @@
     if (!msg || !msg.type) return false;
 
     if (msg.type === "PING") {
-      sendResponse({ ok: true, version: "0.4.1" });
+      sendResponse({ ok: true, version: "0.5.0" });
       return false;
     }
     if (msg.type === "TRANSLATE_PAGE") {

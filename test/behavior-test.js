@@ -18,6 +18,7 @@ function makeEnv(html, options = {}) {
   });
   const { window } = dom;
   const { document } = window;
+  window.TextEncoder = TextEncoder;
 
   // jsdom leaves overflow shorthand unexpanded in computed overflowX/Y.
   // Supply the axis values a browser CSSOM reports for these layout fixtures.
@@ -89,6 +90,7 @@ function makeEnv(html, options = {}) {
   const progressEvents = [];
   let autoRespond = options.autoRespond !== false;
   let responseFor = () => undefined;
+  let connection = { ok: true, paired: true, pairing: "paired", online: true, available: true };
   const logs = [];
   window.console.log = (...args) => logs.push(args.join(" "));
   window.console.warn = (...args) => logs.push(args.join(" "));
@@ -97,6 +99,7 @@ function makeEnv(html, options = {}) {
   function defaultResponse(request, label = "译") {
     return {
       ok: true,
+      identity: { profile: { id: "translate.fast", version: "m0-1", locality: "LOCAL" }, promptVersion: "translate-batch-v1" },
       results: request.msg.items.map((item) => ({
         id: item.id,
         translation: "【" + label + "】" + item.text
@@ -115,6 +118,7 @@ function makeEnv(html, options = {}) {
   window.chrome = {
     runtime: {
       sendMessage(msg) {
+        if (msg && msg.type === "CHECK_CONNECTION") return Promise.resolve(connection);
         if (msg && msg.type === "TRANSLATION_PROGRESS") progressEvents.push(msg.progress);
         if (!msg || msg.type !== "TRANSLATE_BATCH") return Promise.resolve(undefined);
 
@@ -137,7 +141,8 @@ function makeEnv(html, options = {}) {
           Promise.resolve().then(() => {
             if (!pending.includes(request)) return;
             const custom = responseFor(request);
-            settle(request, custom === undefined ? defaultResponse(request) : custom);
+            settle(request, custom === undefined ? defaultResponse(request) :
+              { identity: defaultResponse(request).identity, ...custom });
           });
         }
         return promise;
@@ -208,6 +213,7 @@ function makeEnv(html, options = {}) {
     setResponseFor(fn) {
       responseFor = fn;
     },
+    setConnection(value) { connection = value; },
     resolveRequest(request, label) {
       settle(request, defaultResponse(request, label));
     },
@@ -941,7 +947,7 @@ async function scenario(name, run) {
     env.dom.window.close();
   });
 
-  await scenario("selection rejects overlong text and shows safe model errors", async () => {
+  await scenario("selection rejects overlong text and shows safe Runtime errors", async () => {
     const env = makeEnv(pageWithTexts(["Ordinary page text"]), {
       dynamic: false,
       config: { hardTextLimit: 20 }
@@ -950,10 +956,10 @@ async function scenario(name, run) {
     assert.strictEqual(env.requests.length, 0, "overlong selection never reaches the model");
     assert(env.document.querySelector(".local-ai-selection-card").textContent.includes("过长"));
 
-    env.setResponseFor(() => ({ ok: false, kind: "model", error: "raw secret model response" }));
+    env.setResponseFor(() => ({ ok: false, kind: "unavailable", error: "raw secret response" }));
     await env.send({ type: "TRANSLATE_SELECTION", selectionText: "Model error text" });
     const cardText = env.document.querySelector(".local-ai-selection-card").textContent;
-    assert(cardText.includes("本地模型不可用"));
+    assert(cardText.includes("Translation 不可用"));
     assert(!cardText.includes("raw secret") && !cardText.includes("Model error text"));
     assert(!env.logs.join(" ").includes("Model error text"), "logs never include selection text");
     env.dom.window.close();
@@ -1011,6 +1017,89 @@ async function scenario(name, run) {
     env.dom.window.close();
   });
 
+  await scenario("Runtime batching obeys item, character and exact UTF-8 budgets without record splitting", async () => {
+    const texts = Array.from({ length: 70 }, (_, i) => "Small record number " + i);
+    const env = makeEnv(pageWithTexts(texts), { dynamic: false });
+    await env.translate();
+    assert(env.requests.length >= 3);
+    assert(env.requests.every(r => r.msg.items.length <= 32));
+    assert.deepStrictEqual(env.sentTexts(), texts);
+    env.dom.window.close();
+    const unicode = Array.from({ length: 6 }, (_, i) => "English " + i + " " + "中".repeat(600));
+    const utf8 = makeEnv(pageWithTexts(unicode), { dynamic: false });
+    await utf8.translate();
+    assert(utf8.requests.every(r => r.msg.items.reduce((sum, item) => sum + new TextEncoder().encode(item.text).length, 0) <= 4096));
+    assert(utf8.requests.every(r => r.msg.items.reduce((sum, item) => sum + item.text.length, 0) <= 2800));
+    assert.deepStrictEqual(utf8.sentTexts(), unicode);
+    utf8.dom.window.close();
+  });
+  await scenario("oversized records fail as partial and retry only failed records without truncation", async () => {
+    const long = "English " + "a".repeat(4100);
+    const env = makeEnv(pageWithTexts(["Safe first record", long]), { dynamic: false });
+    env.setResponseFor(request => request.msg.items.some(item => item.text === long) ? { ok: false, kind: "unsupported" } : undefined);
+    const result = await env.translate();
+    assert.strictEqual(result.failed, 1);
+    assert.strictEqual(result.translated, 1);
+    assert.strictEqual((await env.status()).status, "partial");
+    assert(env.sentTexts().includes(long));
+    const before = env.requests.length;
+    await env.translate();
+    assert.deepStrictEqual(env.requests.slice(before).flatMap(r => env.requestTexts(r)), [long]);
+    env.dom.window.close();
+  });
+  await scenario("public Runtime identity invalidates old cache and isolates Single prompt metadata", async () => {
+    const env = makeEnv(pageWithTexts(["Old cached text"]), { dynamic: false });
+    await env.translate(); await env.restore();
+    env.fillPage(["Old cached text", "New identity text"]);
+    const next = { profile: { id: "translate.fast", version: "next-version", locality: "LOCAL" }, promptVersion: "next-batch" };
+    env.setResponseFor(request => ({ ok: true, identity: next, results: request.msg.items.map(item => ({ id: item.id, translation: "New translation" })) }));
+    const changed = await env.translate();
+    assert.strictEqual(changed.failed, 1, "a mixed response cannot insert hits from the prior identity");
+    await env.restore(); env.fillPage(["Old cached text"]);
+    const before = env.requests.length;
+    await env.translate();
+    assert.strictEqual(env.requests.length, before + 1, "observed public profile change evicts old cached text");
+    await env.restore();
+    const large = "English " + "a".repeat(2900);
+    env.fillPage([large]);
+    env.setResponseFor(request => ({ ok: true, identity: { ...next, promptVersion: "next-single" }, results: request.msg.items.map(item => ({ id: item.id, translation: "Single translation" })) }));
+    await env.translate(); await env.restore(); env.fillPage(["Old cached text"]);
+    const afterSingle = env.requests.length;
+    await env.translate();
+    assert.strictEqual(env.requests.length, afterSingle, "Single identity does not contaminate Batch cache");
+    env.dom.window.close();
+  });
+  await scenario("cache reuse cannot bypass Runtime offline or credential revoke", async () => {
+    const env = makeEnv(pageWithTexts(["Cached private text"]), { dynamic: false });
+    await env.translate(); await env.restore();
+    env.setConnection({ ok: true, paired: true, pairing: "paired", online: false, available: false });
+    const before = env.requests.length;
+    const offline = await env.translate();
+    assert.strictEqual(offline.translated, 0);
+    assert.strictEqual(env.requests.length, before);
+    assert.match(offline.error, /Runtime 离线/);
+    env.setConnection({ ok: true, paired: false, pairing: "invalid", online: true, available: false });
+    const selection = await env.send({ type: "TRANSLATE_SELECTION", selectionText: "Cached private text" });
+    assert.strictEqual(selection.ok, false);
+    assert.match(selection.error, /重新配对/);
+    env.dom.window.close();
+  });
+  await scenario("Restore during cache readiness cannot submit stale miss records", async () => {
+    const env = makeEnv(pageWithTexts(["Already cached text"]), { dynamic: false });
+    await env.translate(); await env.restore();
+    env.fillPage(["Already cached text", "New uncached record"]);
+    let finishCheck;
+    env.setConnection(new Promise(resolve => { finishCheck = resolve; }));
+    const before = env.requests.length;
+    const inFlight = env.translate();
+    await wait(0);
+    await env.restore();
+    finishCheck({ ok: true, paired: true, pairing: "paired", online: true, available: true });
+    assert((await inFlight).stale);
+    assert.strictEqual(env.requests.length, before, "cancelled cache preflight never starts a new task");
+    assert.strictEqual(env.translations().length, 0);
+    env.dom.window.close();
+  });
   console.log("\n===== ALL PASS (" + passed.length + " behavior scenarios) =====");
   process.exit(0);
 })().catch((error) => {

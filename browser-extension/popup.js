@@ -2,11 +2,11 @@
  * Local AI Translator — popup
  *
  * popup 只负责「发起操作」和「显示状态」，不拥有任务生命周期。
- * 真正的翻译任务运行在 content script 中（由 background 中转 Ollama 请求），
+ * 真正的翻译任务运行在 content script 中（由 background 中转 Runtime 请求），
  * 因此用户关闭 popup 不会中断翻译。
  *
  * 消息：
- * - CHECK_CONNECTION       → Ollama 在线 / 模型可用
+ * - CHECK_CONNECTION       → 配对 / Runtime 在线 / Translation 可用
  * - ENSURE_CONTENT_SCRIPT  → 按需注入 content script
  * - TRANSLATE_PAGE         → 触发页面翻译（不等整页完成）
  * - GET_STATUS             → 读取当前页面真实状态（popup 重开时恢复显示）
@@ -20,11 +20,18 @@
   ];
 
   const el = {
-    modelName: document.getElementById("modelName"),
-    ollamaDot: document.getElementById("ollamaDot"),
-    ollamaStatus: document.getElementById("ollamaStatus"),
-    modelDot: document.getElementById("modelDot"),
-    modelStatus: document.getElementById("modelStatus"),
+    pairingStatus: document.getElementById("pairingStatus"),
+    extensionOrigin: document.getElementById("extensionOrigin"),
+    pairingId: document.getElementById("pairingId"),
+    pairingSecret: document.getElementById("pairingSecret"),
+    pairingForm: document.getElementById("pairingForm"),
+    btnCopyOrigin: document.getElementById("btnCopyOrigin"),
+    btnPair: document.getElementById("btnPair"),
+    btnForget: document.getElementById("btnForget"),
+    runtimeDot: document.getElementById("runtimeDot"),
+    runtimeStatus: document.getElementById("runtimeStatus"),
+    translationDot: document.getElementById("translationDot"),
+    translationStatus: document.getElementById("translationStatus"),
     btnTest: document.getElementById("btnTest"),
     btnTranslate: document.getElementById("btnTranslate"),
     btnRestore: document.getElementById("btnRestore"),
@@ -42,8 +49,10 @@
   let expectedProgressOperationId = null;
   let expectedProgressSessionGeneration = null;
   let requireProgressMetadata = false;
-  // 优先使用 popup 上下文加载的 config.js；稍后由 GET_CONFIG 补全
-  let modelName = (window.LOCAL_AI_CONFIG && window.LOCAL_AI_CONFIG.model) || "—";
+  let paired = false;
+  let ready = false;
+  let pairingBusy = false;
+  let initialized = false;
 
   /* -------------------- 状态展示 -------------------- */
 
@@ -56,22 +65,81 @@
     dotEl.className = "dot" + (level ? " " + level : "");
   }
 
-  function setOllama(state, text) {
-    setDot(el.ollamaDot, state);
-    el.ollamaStatus.textContent = text;
+  function setRuntime(state, text) {
+    setDot(el.runtimeDot, state);
+    el.runtimeStatus.textContent = text;
   }
 
-  function setModel(state, text) {
-    setDot(el.modelDot, state);
-    el.modelStatus.textContent = text;
+  function setTranslation(state, text) {
+    setDot(el.translationDot, state);
+    el.translationStatus.textContent = text;
   }
 
   function refreshButtons() {
     el.btnTest.disabled = !supported || translating || activeOperation === "translate" ||
-      activeOperation === "restore" || activeOperation === "test";
+      pairingBusy || activeOperation === "restore" || activeOperation === "test";
     el.btnRestore.disabled = !supported || activeOperation === "restore";
     // 翻译进行中禁止重复点击，其余情况仅在页面不支持时禁用
-    el.btnTranslate.disabled = !supported || translating || activeOperation === "translate";
+    el.btnTranslate.disabled = !supported || !paired || !ready || pairingBusy || translating || activeOperation === "translate";
+    el.btnPair.disabled = !initialized || pairingBusy || paired;
+    el.btnForget.disabled = !initialized || pairingBusy;
+  }
+
+  function showPairing(r) {
+    paired = !!r.paired;
+    el.pairingStatus.textContent = r.pairing === "invalid" ? "凭据失效，请重新配对" : paired ? "Paired" : "未配对";
+    el.pairingForm.hidden = paired;
+    el.btnForget.hidden = !paired && r.pairing !== "invalid" && r.pairing !== "storage";
+    refreshButtons();
+  }
+  function clearProof() { el.pairingId.value = ""; el.pairingSecret.value = ""; }
+  async function onPair(event) {
+    event.preventDefault();
+    if (!initialized || pairingBusy || paired) return;
+    const generation = beginOperation("pair");
+    pairingBusy = true;
+    ready = false;
+    refreshButtons();
+    setStatus("正在配对...", "warn");
+    let message;
+    try {
+      message = { type: "PAIR", pairingId: el.pairingId.value.trim(), pairingSecret: el.pairingSecret.value.trim() };
+      // Clear proof before waiting; popup closure or a failed attempt cannot retain it.
+      clearProof();
+      const r = await sendToBackground(message);
+      message.pairingId = ""; message.pairingSecret = "";
+      if (!isCurrentOperation(generation)) return;
+      if (!r.ok) {
+        if (r.kind === "storage") el.btnForget.hidden = false;
+        setStatus(r.error || "配对失败，请创建新配对。", "err");
+        return;
+      }
+      showPairing(r);
+      await testConnection(false, generation);
+    } catch (_) {
+      if (isCurrentOperation(generation)) setStatus("配对状态未知，请在 Windows Assistant 查看 Paired Browsers；必要时撤销后重新创建配对。", "err");
+    } finally {
+      if (message) { message.pairingId = ""; message.pairingSecret = ""; }
+      clearProof();
+      pairingBusy = false;
+      finishOperation(generation);
+    }
+  }
+  async function onForget() {
+    if (pairingBusy) return;
+    const generation = beginOperation("forget");
+    pairingBusy = true;
+    ready = false;
+    refreshButtons();
+    try {
+      const r = await sendToBackground({ type: "FORGET_PAIRING" });
+      if (!isCurrentOperation(generation)) return;
+      if (!r.ok) { setStatus(r.error || "无法删除本地配对。", "err"); return; }
+      clearProof();
+      showPairing(r);
+      setRuntime("", "未检测"); setTranslation("", "不可用");
+      setStatus("已删除本地配对；这不等于 server revoke。请在 Windows Assistant → Paired Browsers 撤销。", "warn");
+    } finally { pairingBusy = false; finishOperation(generation); }
   }
 
   function beginOperation(kind) {
@@ -133,14 +201,14 @@
     return resp;
   }
 
-  /* -------------------- Ollama 检测（由 background 执行） -------------------- */
+  /* -------------------- Runtime 检测（由 background 执行） -------------------- */
 
   async function testConnection(silent, generation) {
     if (generation !== undefined && !isCurrentOperation(generation)) {
       return { cancelled: true };
     }
-    setOllama("", "检测中...");
-    setModel("", "检测中...");
+    setRuntime("", "检测中...");
+    setTranslation("", "检测中...");
     if (!silent) setStatus("正在检测连接...", "warn");
 
     let r;
@@ -151,8 +219,10 @@
       if (generation !== undefined && !isCurrentOperation(generation)) {
         return { cancelled: true };
       }
-      setOllama("err", "离线");
-      setModel("", "不可用");
+      setRuntime("err", "离线");
+      setTranslation("", "不可用");
+      ready = false;
+      refreshButtons();
       if (!silent) setStatus("无法与扩展后台通信，请重试。", "err");
       return { online: false, available: false };
     }
@@ -161,28 +231,26 @@
       return { cancelled: true };
     }
 
-    if (!r.ok || !r.online) {
-      setOllama("err", "离线");
-      setModel("", "不可用");
-      if (!silent) setStatus(r.reason || r.error || "Ollama 未运行。", "err");
-      return { online: false, available: false };
+    showPairing(r);
+    ready = !!(r.ok && r.paired && r.online && r.available);
+    refreshButtons();
+    if (!r.ok || !r.online || !r.paired) {
+      setRuntime(r.online ? "ok" : "err", r.online ? "在线" : "离线");
+      setTranslation("", "不可用");
+      if (!silent || !translating) setStatus(r.reason || r.error || "Runtime 不可用。", "err");
+      return { online: false, available: false, paired: false, reason: r.reason || r.error };
     }
 
-    setOllama("ok", "在线" + (r.version ? " v" + r.version : ""));
+    setRuntime("ok", "在线");
 
     if (r.available) {
-      setModel("ok", "可用");
+      setTranslation("ok", "可用");
       if (!silent) setStatus("准备就绪", "ok");
     } else {
-      setModel("err", "不可用");
-      if (!silent) setStatus(r.reason || ("模型 " + modelName + " 不可用。"), "err");
+      setTranslation("err", "不可用");
+      if (!silent || !translating) setStatus(r.reason || "Translation 不可用。", "err");
     }
     return { online: true, available: !!r.available };
-  }
-
-  /** 预热模型（加载进显存并保持），让首次翻译不必等待加载。失败不影响后续。 */
-  function warmUp() {
-    sendToBackground({ type: "WARMUP" }).catch(() => {});
   }
 
   /* -------------------- 页面辅助 -------------------- */
@@ -219,6 +287,7 @@
 
   /** 发起翻译后立即返回，不等待整页完成（任务在 content script 中继续）。 */
   async function onTranslate() {
+    if (!paired || !ready || pairingBusy || translating) return;
     const generation = beginOperation("translate");
     if (!currentTabId) {
       if (isCurrentOperation(generation)) setStatus("无法获取当前标签页。", "err");
@@ -242,11 +311,11 @@
       const conn = await testConnection(true, generation);
       if (!isCurrentOperation(generation) || conn.cancelled) return;
       if (!conn.online) {
-        setStatus("Ollama 未运行，无法翻译。请启动 Ollama 后重试。", "err");
+        setStatus(conn.reason || "Runtime 离线，请启动 Personal AI Runtime 后重试。", "err");
         return;
       }
       if (!conn.available) {
-        setStatus("模型 " + modelName + " 不可用。请先运行：ollama pull " + modelName, "err");
+        setStatus("Translation 不可用，请在 Windows Assistant 检查翻译服务。", "err");
         return;
       }
 
@@ -389,7 +458,7 @@
       refreshButtons();
     } else if (p.status === "partial") {
       // partial 可能带有 watching=true：保留「监听中」提示，同时说明仍有失败可重试
-      setStatus("部分内容翻译失败，可重试" + (translating && p.total ? "（" + (p.done || 0) + " / " + p.total + " 段）" : ""), "warn");
+      setStatus((p.error ? p.error + " " : "") + "部分内容翻译失败，可重试" + (translating && p.total ? "（" + (p.done || 0) + " / " + p.total + " 段）" : ""), "warn");
       translating = false;
       refreshButtons();
     } else if (translating && p.status === "translating") {
@@ -426,7 +495,7 @@
       } else if (st.status === "translated") {
         setStatus("页面已翻译。", "ok");
       } else if (st.status === "partial") {
-        setStatus("部分翻译完成。", "warn");
+        setStatus(st.error || "部分翻译完成。", "warn");
       }
     } catch (e) {
       if (!isCurrentOperation(generation)) return;
@@ -436,45 +505,48 @@
   }
 
   async function init(generation) {
-    el.modelName.textContent = modelName;
-
     const tab = await getActiveTab();
     if (!isCurrentOperation(generation)) return;
     currentTabId = tab ? tab.id : null;
     supported = !!(tab && !isUnsupported(tab.url));
+    initialized = true;
     refreshButtons();
 
     if (!supported) {
-      setOllama("warn", "—");
-      setModel("warn", "—");
+      setRuntime("warn", "—");
+      setTranslation("warn", "—");
       setStatus("当前页面不支持翻译。", "warn");
-      return;
     }
 
-    // 先恢复页面状态（是否有已有译文），再静默检测连接并预热模型
-    await restorePageState(generation);
+    if (supported) await restorePageState(generation);
     if (!isCurrentOperation(generation)) return;
-    const conn = await testConnection(true, generation);
-    if (isCurrentOperation(generation) && conn.online && conn.available) warmUp();
+    await testConnection(true, generation);
   }
 
   el.btnTest.addEventListener("click", onTest);
   el.btnTranslate.addEventListener("click", onTranslate);
   el.btnRestore.addEventListener("click", onRestore);
+  el.pairingForm.addEventListener("submit", onPair);
+  el.btnForget.addEventListener("click", () => onForget().catch(() => setStatus("无法删除本地配对，请重试。", "err")));
+  el.extensionOrigin.value = "chrome-extension://" + chrome.runtime.id;
+  el.btnCopyOrigin.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(el.extensionOrigin.value); setStatus("Extension Origin 已复制。", "ok"); }
+    catch (_) { setStatus("无法复制，请手动复制 Extension Origin。", "warn"); }
+  });
+  window.addEventListener("pagehide", clearProof);
 
   async function boot() {
     const generation = beginOperation("init");
     refreshButtons();
     try {
-      const r = await sendToBackground({ type: "GET_CONFIG" });
+      const r = await sendToBackground({ type: "GET_PAIRING" });
       if (!isCurrentOperation(generation)) return;
-      if (r && r.ok && r.model) modelName = r.model;
+      if (r && r.ok) showPairing(r);
     } catch (e) {
       if (!isCurrentOperation(generation)) return;
-      console.warn("[LAT] 获取配置失败，使用默认值。");
+      console.warn("[LAT] 获取配对状态失败。");
     }
     if (!isCurrentOperation(generation)) return;
-    el.modelName.textContent = modelName;
     try {
       await init(generation);
     } catch (e) {
@@ -482,6 +554,7 @@
       console.error("[LAT] 初始化失败。");
       setStatus("初始化失败，请重新打开扩展。", "err");
     } finally {
+      initialized = true;
       finishOperation(generation);
     }
   }
