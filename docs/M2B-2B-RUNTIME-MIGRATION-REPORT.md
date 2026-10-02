@@ -2,6 +2,8 @@
 
 Date: 2026-10-03 (Asia/Shanghai). Stage: Chrome Extension → Shared Runtime Migration.
 
+Sections 1–40 preserve the original implementation-stage PARTIAL record. **The current final acceptance decision is in section 41.**
+
 ## 1. Result
 
 **PARTIAL / AWAITING REAL CHROME ACCEPTANCE — confirmed Runtime security contract blocker.**
@@ -324,3 +326,74 @@ Only after all GO gates and the separately authorized publication should Workspa
 Reference API behavior was checked against [Chrome storage API](https://developer.chrome.com/docs/extensions/reference/api/storage),
 [Chrome extension cross-origin requests](https://developer.chrome.com/docs/extensions/develop/concepts/network-requests), and local Chrome DevTools protocol schema.
 The absence of Origin is a current real-Chrome network observation, not an inference from those documents.
+
+## 41. Final Closing / Real Chrome Acceptance — 2026-10-03
+
+**M2B-2B — CLOSED — GO. Candidate only; awaiting Closing Review.**
+
+The unchanged implementation passed the remaining real Chrome acceptance. No additional Extension or Runtime product-code fix was needed. This closing adds documentation only. It does not merge, push, tag, release, close M2, or authorize M2 Final Cross-Repo Sync.
+
+### Baselines and original blocker
+
+- Extension: `qianlixunbai/local-ai-assistant`, branch `m2b2b-runtime-migration`, implementation HEAD `ddfa4a02cace8480bdef78862a907e48a65c6b7c`; working tree clean before acceptance and still clean before this documentation edit.
+- Runtime: `qianlixunbai/personal-ai-workspace`, `HEAD == main == origin/main == ad6e8995cf482517be11602c795b1d6331b68e4b`, clean throughout. The existing R1-built Runtime artifact was used; Runtime source was not changed or rebuilt in this round.
+- The original failure was authenticated Browser GET without Origin entering native authentication and receiving 401. R1 resolved that contract blocker. This round independently exercised real authenticated readiness, submission, polling, and DOM results against the R1 baseline.
+- Extension `main/origin/main` remain `75bede161e7e81d2e7c0fa8e62ac2d05a7248c83`. The final commit is the documentation-only commit containing this section, subject `docs: close M2B-2B real Chrome acceptance`; its exact SHA is supplied in the closing handoff. The accepted implementation remains `ddfa4a0`.
+
+### Environment and evidence
+
+Real **headful Chrome 154.0.8037.59**, isolated profile, unchanged unpacked `browser-extension/`. Exact Origin: `chrome-extension://ondbfogghjoeaibikagokmddmhcbijgg`.
+Real Windows Assistant WPF controls created pairing proofs and revoked the uniquely matched Extension client. The already configured native trust domain was used; no native credential was replaced. Proofs traveled from the GUI into the actual popup through the verification runner's memory, without clipboard copying, command-line secret arguments, or proof files.
+
+Selection used actual Chrome right-click menus: browser mouse input opened the native menu, and Windows UI Automation invoked **使用 Local AI 翻译选中文本**. No direct context-menu handler call or synthetic `info`/frame/document payload replaced that interaction.
+
+The existing verification-only loopback provider relay forwarded to the running local inference service. Stopping the relay provided the safe equivalent Provider-unavailable environment; the actual Provider process stayed running. The long-task check delayed forwarding by 35 seconds and then performed real inference. This establishes the requested long Runtime-task behavior, rather than claiming naturally slow model inference.
+
+Ignored local evidence: `.verification/m2b2b-final/core-evidence.json`, `extra-checkpoint.json`, `supplement-evidence.json`, and `final-privacy-audit-evidence.json`. Metadata was recorded without credential/proof/header values or raw task bodies. Real DOM screenshots of the complex guide and native Selection card were visually inspected. Verification tools and artifacts remain ignored and are not part of the closing commit.
+
+### Final gate results
+
+| Gate | Result and real evidence |
+| --- | --- |
+| Pairing / trusted storage | PASS — popup exact Origin → Windows Assistant Pair Browser → actual exchange; proof inputs cleared, Browser credential in trusted storage, popup reopen and Chrome restart retain Paired. |
+| Readiness | PASS — natural Origin-less authenticated GET 200; Runtime online, Translation available, Translate enabled. Content script cannot read the credential; credential is absent from popup/page DOM. |
+| Ordinary Full Page / Footer | PASS — four source records, one real Batch generation, Chinese DOM results with original English retained. |
+| Complex page / viewport / batches | PASS — equivalent complex guide with 18 article paragraphs, Footer and independently scrollable navigation; visible paragraph 9 inserted before offscreen paragraph 0; multiple real generations and correct adjacent Chinese. Actual MDN website was not used. |
+| Sidebar / nested scroll / DOM | PASS — initially two readable sidebar items translated; clipped items wait, bottom items catch up on nested scroll; returning to completed items does not generate duplicates. Original text, href and target retained. Restore removes translation/source/progress markers and stops scroll-triggered translation. |
+| Dynamic initial catch-up | PASS — existing `test/dynamic-test-page.html`: Load More during delayed initial inference is translated after the initial pass; ordinary Load More also produces real incremental translation. |
+| Dynamic partial / retry | PASS — a controlled one-generation Provider failure leaves nine successful records intact. No automatic partial retry; explicit retry sends only failed records. Retry legitimately uses two batches under the existing first-batch budget. |
+| Watcher / Restore / stale output | PASS — Restore stops watching and further Load More does not generate; Translate re-arms watching. Restore during actual inference discards old results; a subsequent Translate succeeds. |
+| Selection / card / cache / stale | PASS — actual native right-click, Chinese floating card, close, same-text zero-generation cache reuse. An old delayed Selection result cannot replace the newer card. |
+| Frame / document / editable / password | PASS — ordinary text input, contenteditable and designMode explicit Selection; same-origin frame result stays in that frame. Cross-origin frame safely rejects with no top-document fallback. Password menu was offered and actually invoked, but produced no submission/card. Navigation during Selection inference inserts no old result into the new document. No Selection clipboard use. |
+| Full-page privacy fixture | PASS — existing `test/privacy-hotfix-page.html`: hidden inline, collapsed, aria-hidden and editable drafts excluded from submission; iframe full-page boundary retained; nested scroll catch-up and Restore succeed. |
+| Page cache | PASS — actual Translate → Restore → Translate: second pass produces all four DOM translations with zero additional Provider generations. |
+| Cache authentication | PASS — real cached native Selection cannot bypass Runtime offline, Provider-unavailable readiness, or revoked credential. |
+| Runtime offline / recovery | PASS — own Runtime stopped while Provider remains running; popup explicitly offline and disabled, no new page translation; cached Selection displays controlled Runtime-offline failure. Restart recovers using the original Browser credential without re-pairing. |
+| Provider offline / recovery | PASS — Runtime stays running while relay route is stopped; controlled Translation-unavailable UI, without model name, provider URL, raw Provider error or Runtime body. Restoring the route completes a new four-record full-page Translate. |
+| Windows Assistant Revoke / re-pair | PASS — GUI Paired Browsers → exact client Revoke; cached Selection readiness GET 401, zero inference, invalid-pairing popup and disabled Translate. Forget local pairing → new GUI proof → exchange → readiness → new four-record Translate succeeds. This closes the earlier M2B-1 incomplete Revoke E2E limitation. |
+| MV3 30–45-second task | PASS — **38,231 ms**, one actual Provider generation, four correct DOM translations after popup closure. Worker debugger detached before submission; no worker debugger attached during this check. Popup reconnect follows completion. |
+| Runtime-only network | PASS — observed Extension requests use only `127.0.0.1:8765`, with Batch POST 202, readiness/task GET 200 and deliberate revoke GET 401. No Extension access to `11434` or direct Provider fallback. |
+| Automated / static / privacy | PASS — commands and audit details below. |
+
+Cache production identity was re-read and confirmed as normalized text + targetLanguage + profile.id + profile.version + promptVersion. No model or Provider generation settings participate in the key.
+Manifest retains only Runtime host permission `http://127.0.0.1:8765/*`. Production contains no forbidden Provider endpoint/model/prompt/generation references, or offscreen/alarms/ping/daemon/WebSocket/keepalive workaround.
+
+### Regression and final audit
+
+- `npm ci`: PASS, 0 vulnerabilities.
+- `npm test`: **104 PASS** — 29 content behavior scenarios, 70 Runtime/security checks, 5 popup lifecycle/pairing scenarios. No tests were removed or reduced in this round.
+- `node test/static-audit.js`: **13 PASS**, all 11 production files; required production Provider/Ollama/11434 reference count zero.
+- `git diff --check`: PASS.
+- Actual secret/body artifact audit: 29 Extension source files + 13 final verification artifacts, 42 file checks, **0 matches**; five current ephemeral secret values supplied in memory/stdin only.
+- Runtime source/build/archive privacy audit: 110 source files, 1,120 files, 33,589 byte/archive checks, 127 archives, six expected private native credentials and the current ephemeral values; **0 matches**, zero tracked build artifacts, ignore checks PASS. These are the closing-run audit counts, not a coverage target.
+- Own Windows Assistant, Runtime, Chrome, fixture servers and relay stopped. Owned final Chrome profile containing the Browser credential removed after checking its absolute path. The actual Provider listener remains running. Both repositories retain the stated baselines until this Extension documentation-only commit.
+
+### Failure classification and scope
+
+No genuine Extension/Runtime contract or product-code failure requiring a fix was confirmed. Verification-tool issues were corrected without changing the candidate: PowerShell encoding/parameter handling, modal-window lookup, fixture anchor expectations, partial-retry batch-count assumptions, native click coordinates obscured by the prior card, and popup target lifetime.
+
+The final tool issue reproduced as successful re-pair/readiness followed by no new full-page task, while the runner held a stale popup/tab connection. Waiting until the old actual popup was fully destroyed and resolving the current tab corrected the verification target; the complete cached Revoke/re-pair/new-Translate chain then passed unchanged. No UI/parser/client redesign, security weakening, transport mocking, or product keepalive was used to obtain PASS.
+
+**Additional product-code fixes: NONE. B11 inline BR layout: DEFERRED. B12 mutation debounce starvation: DEFERRED.**
+Summarize/Ask, Finance/Memory and test slimming were not started. Test slimming remains a separately scoped task after M2 Final Cross-Repo Sync.
+All final gates now PASS on the unchanged implementation. The candidate is **CLOSED — GO / awaiting Closing Review**, with no merge/push/tag/release performed. M2 Final Cross-Repo Sync remains pending the user's review and separately authorized next step.
