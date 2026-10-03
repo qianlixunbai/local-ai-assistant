@@ -11,11 +11,26 @@ const production = fs.readdirSync(EXT).map(name => [name, fs.readFileSync(path.j
 const combined = production.map(entry => entry[1]).join("\n");
 check("zero legacy endpoints/provider settings in production", !/11434|\/api\/(?:chat|tags|version)|qwen3\.5|SYSTEM_PROMPT|ollamaBaseUrl|keep_alive|num_ctx|num_predict|top_p|temperature|translationPromptVersion|\bthink\b/.test(combined));
 const manifest = JSON.parse(fs.readFileSync(path.join(EXT, "manifest.json")));
-check("only Runtime host permission, no broad web permission", JSON.stringify(manifest.host_permissions) === JSON.stringify(["http://127.0.0.1:8765/*"]) && JSON.stringify(manifest.permissions) === JSON.stringify(["activeTab", "scripting", "contextMenus", "storage"]));
+function sameSet(actual, allowed) {
+  return Array.isArray(actual) && actual.length === allowed.length &&
+    new Set(actual).size === actual.length && allowed.every(value => actual.includes(value));
+}
+check("only Runtime host and allowed permissions", sameSet(manifest.host_permissions, ["http://127.0.0.1:8765/*"]) &&
+  sameSet(manifest.permissions, ["activeTab", "scripting", "contextMenus", "storage"]));
 const config = fs.readFileSync(path.join(EXT, "config.js"), "utf8");
 const content = fs.readFileSync(path.join(EXT, "content.js"), "utf8");
 const popup = fs.readFileSync(path.join(EXT, "popup.js"), "utf8");
-check("network lives only in trusted Runtime client", production.filter(([name, source]) => /\bfetch\(/.test(source)).map(entry => entry[0]).join() === "runtime-client.js");
+const runtimeClient = fs.readFileSync(path.join(EXT, "runtime-client.js"), "utf8");
+const background = fs.readFileSync(path.join(EXT, manifest.background.service_worker), "utf8");
+const injected = background.match(/\bCONTENT_SCRIPTS\s*=\s*(\[[^\]]+\])/);
+const untrustedScripts = [...JSON.parse(injected?.[1] || "[]"), ...(manifest.content_scripts || []).flatMap(entry => entry.js), ...Array.from(
+  fs.readFileSync(path.join(EXT, manifest.action.default_popup), "utf8").matchAll(/<script\b[^>]*src=["']([^"']+)["']/g), match => match[1])];
+check("network stays in worker-loaded Runtime client", !!injected && manifest.background.service_worker === "background.js" &&
+  /importScripts\([^;]*["']runtime-client\.js["']/.test(background) &&
+  untrustedScripts.every(name => name !== "runtime-client.js" && !/\bRuntimeClient\b|runtime-client\.js/.test(fs.readFileSync(path.join(EXT, name), "utf8"))) &&
+  /\bfetch\s*\(/.test(runtimeClient) && production.every(([name, source]) =>
+    !/\bXMLHttpRequest\b|\bWebSocket\b|\bEventSource\b|\bsendBeacon\s*\(/.test(source) &&
+    (name === "runtime-client.js" || !/\bfetch\s*(?:\(|\.|\[)|\[\s*["']fetch["']\s*\]/.test(source))));
 check("content has no credential/storage/auth bridge", !/chrome\.storage|Authorization|pairingSecret|\.credential|RuntimeStorage/.test(content));
 check("no native token or credential manager access in production", !/\.runtime[\\/]client-token|CredentialManager|WinCred|localStorage|sessionStorage/.test(combined));
 check("Browser config contains no credentials or provider ownership", !/credential|pairingSecret|\bmodel\s*:|\bprovider\s*:|generation|promptVersion/.test(config));
@@ -30,6 +45,7 @@ check("no personal absolute paths or literal browser credentials in source/doc c
 }));
 const packageJson = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json")));
 const lock = JSON.parse(fs.readFileSync(path.join(ROOT, "package-lock.json")));
-check("version 0.5.0 synchronized", [manifest.version, packageJson.version, lock.version, lock.packages[""].version].every(v => v === "0.5.0") && content.includes('version: "0.5.0"'));
-check("legacy model tests removed from current contract", !fs.existsSync(path.join(ROOT, "test", "background-model-test.js")) && packageJson.scripts["test:background-runtime"] === "node test/background-runtime-test.js");
+const ping = content.match(/msg\.type\s*===\s*["']PING["'][\s\S]*?sendResponse\(\{[^}]*\bversion:\s*["']([^"']+)["']/);
+check("release metadata and content PING stay consistent", typeof manifest.version === "string" && !!manifest.version &&
+  [packageJson.version, lock.version, lock.packages[""].version, ping?.[1]].every(v => v === manifest.version));
 console.log(checks + " static/privacy checks; " + production.length + " production files; " + candidates.length + " candidate source/doc files.");

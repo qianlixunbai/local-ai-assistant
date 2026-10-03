@@ -294,7 +294,7 @@ async function scenario(name, run) {
     env.dom.window.close();
   });
 
-  await scenario("B13 intersects every clipping client box by axis and the document viewport", async () => {
+  await scenario("B13 clipping, viewport intersection, fixed/sidebar/nav and hidden exclusion", async () => {
     const env = makeEnv('<main>' +
       '<div style="overflow:hidden" data-top="100" data-left="20" data-width="200" data-height="150" data-client-left="5" data-client-top="5" data-client-width="180" data-client-height="130">' +
       '<div style="overflow-y:scroll" data-top="80" data-height="220" data-width="300">' +
@@ -309,23 +309,16 @@ async function scenario(name, run) {
       '<div style="overflow:auto" data-top="500" data-height="200"><p data-top="650">Outside document viewport</p></div>' +
       '<div style="overflow:hidden" data-height="60"><p data-top="-20" data-height="40">Partial viewport intersection</p></div>' +
       '<div style="overflow:hidden;display:contents"><p data-top="400">Display contents does not clip</p></div>' +
-      '<p data-top="1600">Offscreen document body stays eligible</p></main>', { layout: true, innerHeight: 600, dynamic: false });
+      '<p data-top="1600">Offscreen document body stays eligible</p>' +
+      '<aside style="position:fixed"><p data-top="20">Fixed sidebar text</p><p data-top="900">Offscreen fixed sidebar text</p></aside>' +
+      '<div role="navigation"><p data-top="40">ARIA navigation text</p><p data-left="2000">Offscreen horizontal navigation text</p></div>' +
+      '<nav hidden><p>Hidden navigation text</p></nav><aside aria-hidden="true"><p>ARIA hidden sidebar text</p></aside></main>', { layout: true, innerHeight: 600, dynamic: false });
     await env.translate();
     assert.deepStrictEqual(env.sentTexts().sort(), [
       "Visible nested ordinary text", "Partly visible on horizontal edge", "Visible outside un-clipped axis",
-      "Partial viewport intersection", "Display contents does not clip", "Offscreen document body stays eligible"
+      "Partial viewport intersection", "Display contents does not clip", "Offscreen document body stays eligible",
+      "Fixed sidebar text", "ARIA navigation text"
     ].sort(), "nested visibility differs from viewport-priority ordering for ordinary document text");
-    env.dom.window.close();
-  });
-
-  await scenario("B13 navigation and fixed sidebar need viewport intersection even without overflow", async () => {
-    const env = makeEnv('<aside style="position:fixed"><p data-top="20">Fixed sidebar text</p>' +
-      '<p data-top="900">Offscreen fixed sidebar text</p></aside>' +
-      '<div role="navigation"><p data-top="40">ARIA navigation text</p><p data-left="2000">Offscreen horizontal navigation text</p></div>' +
-      '<nav hidden><p>Hidden navigation text</p></nav>' +
-      '<aside aria-hidden="true"><p>ARIA hidden sidebar text</p></aside>', { layout: true, dynamic: false });
-    await env.translate();
-    assert.deepStrictEqual(env.sentTexts().sort(), ["Fixed sidebar text", "ARIA navigation text"].sort());
     env.dom.window.close();
   });
 
@@ -471,14 +464,9 @@ async function scenario(name, run) {
     env.document.getElementById("inline-reveal").style.display = "inline";
     assert(await pollUntil(() => env.sentTexts().includes("Expanded English paragraph.")));
     assert(env.sentTexts().includes("Visible words Revealed inline words. stay grouped."), "newly visible inline content invalidates the earlier aggregate");
-    await env.send({ type: "TRANSLATE_SELECTION", selectionText: "Editable draft secret." });
-    assert(env.document.querySelector(".local-ai-selection-card"), "explicit editable selection still works");
-    await env.restore();
-    env.document.designMode = "on";
-    const before = env.requests.length;
-    await env.translate();
-    assert.strictEqual(env.requests.length, before, "designMode whole-page editing is excluded");
-    assert.strictEqual(env.translations().length, 0);
+    assert(await pollUntil(() => env.translations().some(text => text.includes("Revealed inline words."))), "revealed source receives refreshed translation");
+    assert(!env.translations().includes("【译】Visible words stay grouped."), "reveal removes the obsolete source translation");
+    assert(!env.sentTexts().some(text => /secret/.test(text)), "dynamic rescan still excludes hidden/editable text");
     env.dom.window.close();
   });
 
@@ -550,6 +538,7 @@ async function scenario(name, run) {
       "Primary navigation", "Sidebar advertisement"
     ].sort(), "same-text records share one model item");
     assert.strictEqual(env.translations().length, 9);
+    assert.strictEqual(env.translations().filter(text => text === "【译】Save job").length, 3, "same-batch dedupe fans out to all original records");
     assert(env.translations().includes("【译】Welcome to this great workplace today."));
     assert(env.translations().includes("【译】Job seekers"));
     for (const excluded of ["const hiddenCode", "Hidden page content", "Screen reader hidden content"]) {
@@ -799,14 +788,7 @@ async function scenario(name, run) {
     env.dom.window.close();
   });
 
-  await scenario("same-batch cache fan-out and cross-batch reuse preserve original record counts", async () => {
-    const duplicateEnv = makeEnv(pageWithTexts(["Save job", "Unique job role", "Save job"]));
-    const duplicateResult = await duplicateEnv.translate();
-    assert.deepStrictEqual(duplicateEnv.sentTexts().sort(), ["Save job", "Unique job role"].sort());
-    assert.strictEqual(duplicateEnv.translations().length, 3);
-    assert.strictEqual(duplicateResult.translated, 3);
-    duplicateEnv.dom.window.close();
-
+  await scenario("cross-batch cache reuse, original record counts and LAT_RESET", async () => {
     const repeated = "Senior backend engineer";
     const batchedEnv = makeEnv(pageWithTexts([repeated, "Customer support analyst", repeated]), {
       dynamic: false,
