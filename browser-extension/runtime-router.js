@@ -3,7 +3,9 @@ async function checkConnection() {
   const epoch = RuntimeStorage.epoch();
   try {
     const token = await RuntimeStorage.credential();
-    return { paired: true, pairing: "paired", ...await RuntimeClient.readiness(token) };
+    const readiness = await RuntimeClient.readiness(token);
+    if (epoch !== RuntimeStorage.epoch() || token !== await RuntimeStorage.credential()) throw RuntimeClient.error("unpaired");
+    return { paired: true, pairing: "paired", ...readiness };
   } catch (e) {
     if (e.kind === "unauthorized" && epoch === RuntimeStorage.epoch()) await RuntimeStorage.invalidate(epoch);
     return { paired: !["unpaired", "storage", "unauthorized"].includes(e.kind),
@@ -30,7 +32,7 @@ const handlers = {
     const epoch = RuntimeStorage.epoch();
     const token = await RuntimeStorage.credential();
     let translated;
-    try { translated = await RuntimeClient.translate(msg.items, token); }
+    try { translated = await RuntimeClient.translate(msg.items, token, msg.expectedIdentity); }
     catch (e) {
       if (e.kind === "unauthorized" && epoch === RuntimeStorage.epoch()) await RuntimeStorage.invalidate(epoch);
       throw e;

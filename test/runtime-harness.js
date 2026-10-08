@@ -27,7 +27,7 @@ function makeBackground(options = {}) {
   const store = options.store || (options.unpaired ? {} : { runtimePairing: { credential: CREDENTIAL, clientId: CLIENT_ID, origin: ORIGIN } });
   let responder = options.fetch || (async (url, init) => {
     if (url.endsWith("/exchange")) return json({ client: { clientId: CLIENT_ID, clientType: "browser-extension", origin: ORIGIN, allowedCapabilities: ["translate"] }, credential: CREDENTIAL });
-    if (url.endsWith("/readiness")) return json({ available: true });
+    if (new URL(url).pathname.endsWith("/readiness")) return json({ available: true });
     if (init.method === "POST") return json(task(), 202, { Location: "/api/v1/tasks/" + TASK_ID });
     return json(task("SUCCEEDED"));
   });

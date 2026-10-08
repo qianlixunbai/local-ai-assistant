@@ -119,6 +119,35 @@ function taskWorker(view) {
   check("Forget deletes local pairing without server management calls", !(await paired.send({ type: "FORGET_PAIRING" })).paired && !paired.store.runtimePairing && paired.calls.length === beforeForget);
   check("Unpaired translate has no backend request", (await paired.translateBatch(items)).kind === "unpaired" && paired.calls.length === beforeForget);
   check("Readiness is authenticated and consumes safe availability only", (await bg.checkConnection()).available && bg.calls.at(-1).init.headers.Authorization === "Bearer " + CREDENTIAL);
+  const cache = { version: 1, single: { ...identity, promptVersion: "translate-v1" }, batch: identity };
+  const identityWorker = makeBackground({ fetch: async () => json({ available: true, cacheIdentity: cache }) });
+  const identityStatus = await identityWorker.checkConnection();
+  check("Opt-in readiness forwards only validated Single/Batch identity", identityStatus.available &&
+    JSON.stringify(identityStatus.cacheIdentity) === JSON.stringify(cache) &&
+    identityWorker.calls[0].url.endsWith("/readiness?cacheIdentityVersion=1") && identityWorker.calls[0].init.cache === "no-store");
+  check("Legacy Runtime readiness preserves translation without cache authority", (await bg.checkConnection()).cacheIdentity === null &&
+    (await bg.translateBatch(items)).ok);
+  for (const badCache of [ { ...cache, version: 2 }, { ...cache, extra: "PRIVATE" },
+    { ...cache, single: { ...cache.single, promptVersion: "translate-batch-v1" } },
+    { ...cache, batch: { ...identity, profile: { ...identity.profile, version: "other" } } },
+    { ...cache, batch: { ...identity, profile: { ...identity.profile, model: "PRIVATE" } } }, null ]) {
+    const invalidIdentity = makeBackground({ fetch: async () => json({ available: true, cacheIdentity: badCache }) });
+    const result = await invalidIdentity.checkConnection();
+    check("Malformed cache identity disables availability and leaks no diagnostics", !result.available && !result.cacheIdentity && !JSON.stringify(result).includes("PRIVATE"));
+  }
+  const hugeReadiness = makeBackground({ fetch: async () => json({ available: true, padding: "x".repeat(1024) }) });
+  check("Readiness body has its own 1024-byte limit", !(await hugeReadiness.checkConnection()).available);
+  let completeReadiness;
+  const replacedReadiness = makeBackground({ fetch: () => new Promise(resolve => { completeReadiness = resolve; }) });
+  const pendingReadiness = replacedReadiness.checkConnection();
+  while (!completeReadiness) await new Promise(resolve => setTimeout(resolve, 0));
+  await replacedReadiness.send({ type: "FORGET_PAIRING" });
+  completeReadiness(json({ available: true, cacheIdentity: cache }));
+  check("Credential replacement suppresses late readiness identity", !(await pendingReadiness).available);
+  const mismatch = makeBackground({ fetch: async () => accepted() });
+  const mismatchResult = await mismatch.send({ type: "TRANSLATE_BATCH", items,
+    expectedIdentity: { ...identity, profile: { ...identity.profile, version: "old" } } }, mismatch.content);
+  check("Mixed plan checks accepted identity before polling and never repeats POST", mismatchResult.kind === "freshness" && mismatch.calls.length === 1);
   const offline = makeBackground({ fetch: async () => { throw new Error("PRIVATE"); } });
   check("Runtime offline is explicit", !(await offline.checkConnection()).online);
   const unavailable = makeBackground({ fetch: async () => json({ available: false, error: { code: "PROVIDER_UNAVAILABLE", message: "PRIVATE" }, provider: "PRIVATE" }) });

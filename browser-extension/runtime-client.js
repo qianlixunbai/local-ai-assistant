@@ -11,6 +11,7 @@ const RuntimeClient = (() => {
     busy: "Runtime 繁忙，请稍后重试。",
     timeout: "翻译超时，请稍后重试。",
     cancelled: "翻译任务已取消。",
+    freshness: "翻译身份已变化，请显式重试。",
     invalid: "翻译响应无效，请重试。",
     unsupported: "翻译输入超出 Runtime 安全预算或格式无效。",
     denied: "Runtime 不允许此翻译请求。",
@@ -27,6 +28,21 @@ const RuntimeClient = (() => {
     e.isLatError = true;
     if (Number.isInteger(status)) e.status = status;
     return e;
+  }
+  function exact(value, keys) {
+    return object(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+  }
+  function cacheIdentity(value) {
+    if (!exact(value, ["version", "single", "batch"]) || value.version !== 1) throw error("invalid");
+    const safe = { version: 1 };
+    for (const mode of ["single", "batch"]) {
+      const item = value[mode];
+      if (!exact(item, ["profile", "promptVersion"]) || !exact(item.profile, ["id", "version", "locality"])) throw error("invalid");
+      safe[mode] = identity(item);
+      if (item.promptVersion !== (mode === "single" ? "translate-v1" : "translate-batch-v1")) throw error("invalid");
+    }
+    if (JSON.stringify(safe.single.profile) !== JSON.stringify(safe.batch.profile)) throw error("invalid");
+    return safe;
   }
   function object(value) { return !!value && typeof value === "object" && !Array.isArray(value); }
   function timestamp(value) {
@@ -55,16 +71,17 @@ const RuntimeClient = (() => {
   }
   function codeError(code, status) {
     const kinds = {
-      PROVIDER_UNAVAILABLE: "unavailable", MODEL_UNAVAILABLE: "unavailable", TASK_CANCELLED: "cancelled",
+      PROVIDER_UNAVAILABLE: "unavailable", MODEL_UNAVAILABLE: "unavailable", MODEL_SWITCH_CONFLICT: "busy", MODEL_EXECUTION_UNCERTAIN: "unavailable",
+      MODEL_STATE_UNAVAILABLE: "unavailable", MODEL_IDENTITY_CHANGED: "unavailable", MODEL_CONFIGURATION_INVALID: "unavailable", TASK_CANCELLED: "cancelled",
       TASK_TIMEOUT: "timeout", QUEUE_FULL: "busy", INVALID_REQUEST: "unsupported", POLICY_DENIED: "denied",
       PROVIDER_RESPONSE_INVALID: "invalid", INTERNAL_ERROR: "failed", UNAUTHORIZED: "unauthorized", TASK_NOT_FOUND: "missing"
     };
     return error(kinds[code] || "failed", status);
   }
   // Bounded streaming read. The deadline remains active through headers AND body reads.
-  async function readJSON(response) {
+  async function readJSON(response, limit) {
     const length = response.headers.get("Content-Length");
-    if (length && (!/^\d+$/.test(length) || Number(length) > CFG.runtimeResponseByteLimit)) throw error("invalid");
+    if (length && (!/^\d+$/.test(length) || Number(length) > limit)) throw error("invalid");
     if (!/^application\/json(?:\s*;|$)/i.test(response.headers.get("Content-Type") || "")) throw error("invalid");
     if (!response.body || typeof response.body.getReader !== "function") throw error("invalid");
     const reader = response.body.getReader();
@@ -75,7 +92,7 @@ const RuntimeClient = (() => {
         const part = await reader.read();
         if (part.done) break;
         size += part.value.byteLength;
-        if (size > CFG.runtimeResponseByteLimit) { void reader.cancel().catch(() => {}); throw error("invalid"); }
+        if (size > limit) { void reader.cancel().catch(() => {}); throw error("invalid"); }
         chunks.push(part.value);
       }
     } finally { reader.releaseLock(); }
@@ -85,7 +102,7 @@ const RuntimeClient = (() => {
     try { return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
     catch (_) { throw error("invalid"); }
   }
-  async function request(path, method, body, credential, timeoutMs = CFG.runtimeRequestTimeoutMs) {
+  async function request(path, method, body, credential, timeoutMs = CFG.runtimeRequestTimeoutMs, responseLimit = CFG.runtimeResponseByteLimit) {
     const controller = new AbortController();
     let timer;
     const deadline = new Promise((_, reject) => {
@@ -100,7 +117,7 @@ const RuntimeClient = (() => {
         signal: controller.signal, mode: "cors", redirect: "error", credentials: "omit", cache: "no-store"
       });
       if (response.status === 401) throw error("unauthorized", 401);
-      const data = await readJSON(response);
+      const data = await readJSON(response, responseLimit);
       if (!response.ok) throw codeError(object(data) && data.code, response.status);
       return { response, data };
     })();
@@ -128,10 +145,12 @@ const RuntimeClient = (() => {
     }
   }
   async function readiness(credential) {
-    const { response, data } = await request("/api/v1/capabilities/translate/readiness", "GET", undefined, credential);
+    const { response, data } = await request("/api/v1/capabilities/translate/readiness?cacheIdentityVersion=1", "GET", undefined, credential, CFG.runtimeRequestTimeoutMs, 1024);
     if (response.status !== 200 || !object(data) || typeof data.available !== "boolean" ||
         (data.available && data.error != null) || (!data.available && (!object(data.error) || typeof data.error.code !== "string"))) throw error("invalid");
-    return { online: true, available: data.available, reason: data.available ? "" : codeError(data.error.code).message };
+    const safe = data.cacheIdentity === undefined ? null : cacheIdentity(data.cacheIdentity);
+    if (!data.available && safe !== null) throw error("invalid");
+    return { online: true, available: data.available, cacheIdentity: safe, reason: data.available ? "" : codeError(data.error.code).message };
   }
   function isSingle(text) {
     return text.length > CFG.batchCharLimit || new TextEncoder().encode(text).length > CFG.batchUtf8ByteLimit;
@@ -165,7 +184,7 @@ const RuntimeClient = (() => {
     }
     return items.filter(i => byId.has(i.id)).map(i => ({ id: i.id, translation: byId.get(i.id) }));
   }
-  async function translate(items, credential) {
+  async function translate(items, credential, expectedIdentity) {
     const { ids, single } = validateItems(items);
     const body = { ...(single ? { text: items[0].text } : { items }), sourceLanguage: "en", targetLanguage: CFG.targetLanguage, profile: "translate.fast" };
     if (new TextEncoder().encode(JSON.stringify(body)).length > 32768) throw error("unsupported");
@@ -176,6 +195,8 @@ const RuntimeClient = (() => {
     const view = submission.data;
     if (submission.response.status !== 202) throw error("invalid");
     const acceptedIdentity = task(view);
+    if (acceptedIdentity.promptVersion !== (single ? "translate-v1" : "translate-batch-v1")) throw error("invalid");
+    if (expectedIdentity && JSON.stringify(acceptedIdentity) !== JSON.stringify(identity(expectedIdentity))) throw error("freshness");
     const path = "/api/v1/tasks/" + view.taskId;
     const location = submission.response.headers.get("Location");
     if (location !== path && location !== CFG.runtimeBaseUrl + path) throw error("invalid");

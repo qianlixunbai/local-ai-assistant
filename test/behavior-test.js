@@ -10,6 +10,14 @@ const CONFIG_JS = fs.readFileSync(path.join(EXT, "config.js"), "utf8");
 const DEBOUNCE = 750;
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function cacheIdentity(version = "m0-1") {
+  const profile = { id: "translate.fast", version, locality: "LOCAL" };
+  return { version: 1, single: { profile: { ...profile }, promptVersion: "translate-v1" },
+    batch: { profile: { ...profile }, promptVersion: "translate-batch-v1" } };
+}
+function connection(version = "m0-1") {
+  return { ok: true, paired: true, pairing: "paired", online: true, available: true, cacheIdentity: cacheIdentity(version) };
+}
 function makeEnv(html, options = {}) {
   const dom = new JSDOM(html, {
     url: "https://example.com/",
@@ -90,7 +98,7 @@ function makeEnv(html, options = {}) {
   const progressEvents = [];
   let autoRespond = options.autoRespond !== false;
   let responseFor = () => undefined;
-  let connection = { ok: true, paired: true, pairing: "paired", online: true, available: true };
+  let readiness = connection();
   const logs = [];
   window.console.log = (...args) => logs.push(args.join(" "));
   window.console.warn = (...args) => logs.push(args.join(" "));
@@ -99,7 +107,7 @@ function makeEnv(html, options = {}) {
   function defaultResponse(request, label = "译") {
     return {
       ok: true,
-      identity: { profile: { id: "translate.fast", version: "m0-1", locality: "LOCAL" }, promptVersion: "translate-batch-v1" },
+      identity: { profile: { id: "translate.fast", version: "m0-1", locality: "LOCAL" }, promptVersion: request.msg.items.length === 1 && (request.msg.items[0].text.length > window.LOCAL_AI_CONFIG.batchCharLimit || new TextEncoder().encode(request.msg.items[0].text).length > window.LOCAL_AI_CONFIG.batchUtf8ByteLimit) ? "translate-v1" : "translate-batch-v1" },
       results: request.msg.items.map((item) => ({
         id: item.id,
         translation: "【" + label + "】" + item.text
@@ -118,7 +126,7 @@ function makeEnv(html, options = {}) {
   window.chrome = {
     runtime: {
       sendMessage(msg) {
-        if (msg && msg.type === "CHECK_CONNECTION") return Promise.resolve(connection);
+        if (msg && msg.type === "CHECK_CONNECTION") return Promise.resolve(readiness);
         if (msg && msg.type === "TRANSLATION_PROGRESS") progressEvents.push(msg.progress);
         if (!msg || msg.type !== "TRANSLATE_BATCH") return Promise.resolve(undefined);
 
@@ -213,7 +221,8 @@ function makeEnv(html, options = {}) {
     setResponseFor(fn) {
       responseFor = fn;
     },
-    setConnection(value) { connection = value; },
+    setConnection(value) { readiness = value; },
+    respondRequest(request, response) { settle(request, response); },
     resolveRequest(request, label) {
       settle(request, defaultResponse(request, label));
     },
@@ -709,7 +718,7 @@ async function scenario(name, run) {
     const currentRequest = env.pending.find((request) => request !== staleRequest);
     env.resolveRequest(currentRequest, "CURRENT");
     await currentRun;
-    env.resolveRequest(staleRequest, "STALE");
+    env.rejectRequest(staleRequest, Object.assign(new Error("controlled fixture failure"), { kind: "freshness" }));
     await staleRun;
 
     assert.deepStrictEqual(env.translations(), ["【CURRENT】Race condition role"]);
@@ -1029,26 +1038,82 @@ async function scenario(name, run) {
     assert.deepStrictEqual(env.requests.slice(before).flatMap(r => env.requestTexts(r)), [long]);
     env.dom.window.close();
   });
-  await scenario("public Runtime identity invalidates old cache and isolates Single prompt metadata", async () => {
+  await scenario("readiness invalidates both modes, rejects mixed epochs and refreshes selection", async () => {
     const env = makeEnv(pageWithTexts(["Old cached text"]), { dynamic: false });
     await env.translate(); await env.restore();
-    env.fillPage(["Old cached text", "New identity text"]);
-    const next = { profile: { id: "translate.fast", version: "next-version", locality: "LOCAL" }, promptVersion: "next-batch" };
-    env.setResponseFor(request => ({ ok: true, identity: next, results: request.msg.items.map(item => ({ id: item.id, translation: "New translation" })) }));
-    const changed = await env.translate();
-    assert.strictEqual(changed.failed, 1, "a mixed response cannot insert hits from the prior identity");
-    await env.restore(); env.fillPage(["Old cached text"]);
-    const before = env.requests.length;
+    env.setConnection(connection("epoch-B0"));
+    env.setResponseFor(request => ({ ok: true, identity: cacheIdentity("epoch-B0").batch,
+      results: request.msg.items.map(item => ({ id: item.id, translation: "B0 translation" })) }));
+    const beforeAllHits = env.requests.length;
     await env.translate();
-    assert.strictEqual(env.requests.length, before + 1, "observed public profile change evicts old cached text");
+    assert.strictEqual(env.requests.length, beforeAllHits + 1, "A full-cache hit is bypassed after B readiness");
+    await env.restore();
+    env.fillPage(["Old cached text", "New identity text"]);
+    const next = cacheIdentity("epoch-B");
+    env.setResponseFor(request => ({ ok: true, identity: next.batch, results: request.msg.items.map(item => ({ id: item.id, translation: "B translation" })) }));
+    const beforeMixed = env.requests.length;
+    const changed = await env.translate();
+    assert.strictEqual(changed.failed, 2, "a mixed epoch mismatch rejects hits and misses together");
+    assert.strictEqual(env.translations().length, 0);
+    assert.strictEqual(env.requests.length, beforeMixed + 1, "no automatic replay");
+    assert.strictEqual(env.requests.at(-1).msg.expectedIdentity.profile.version, "epoch-B0");
+    env.setConnection(connection("epoch-B"));
+    await env.restore(); env.fillPage(["Old cached text"]);
+    await env.translate(); await env.restore();
+    const beforeHit = env.requests.length;
+    await env.translate();
+    assert.strictEqual(env.requests.length, beforeHit, "B can be reused after B readiness");
     await env.restore();
     const large = "English " + "a".repeat(2900);
     env.fillPage([large]);
-    env.setResponseFor(request => ({ ok: true, identity: { ...next, promptVersion: "next-single" }, results: request.msg.items.map(item => ({ id: item.id, translation: "Single translation" })) }));
-    await env.translate(); await env.restore(); env.fillPage(["Old cached text"]);
-    const afterSingle = env.requests.length;
+    env.setResponseFor(request => ({ ok: true, identity: next.single, results: request.msg.items.map(item => ({ id: item.id, translation: "B single" })) }));
+    await env.translate(); await env.restore();
+    env.fillPage(["Old cached text", "Pending B record"]);
+    env.setAutoRespond(false);
+    const pendingPage = env.translate();
+    assert(await pollUntil(() => env.pending.length === 1));
+    const oldPlanRequest = env.pending[0];
+    env.setConnection(connection("epoch-A2")); // A->B->A has a fresh opaque epoch.
+    env.setResponseFor(request => ({ ok: true, identity: cacheIdentity("epoch-A2").batch, results: request.msg.items.map(item => ({ id: item.id, translation: "A2 translation" })) }));
+    const beforeSelection = env.requests.length;
+    const selectionRun = env.send({ type: "TRANSLATE_SELECTION", selectionText: "Old cached text" });
+    assert(await pollUntil(() => env.pending.length === 2));
+    const selectionRequest = env.pending.find(request => request !== oldPlanRequest);
+    env.respondRequest(selectionRequest, { ok: true, identity: cacheIdentity("epoch-A2").batch,
+      results: [{ id: 0, translation: "A2 selection" }] });
+    const selection = await selectionRun;
+    assert(selection.ok && !selection.cached);
+    assert.strictEqual(env.requests.length, beforeSelection + 1, "selection cannot read B cache before readiness");
+    env.respondRequest(oldPlanRequest, { ok: true, identity: next.batch,
+      results: oldPlanRequest.msg.items.map(item => ({ id: item.id, translation: "Old B task" })) });
+    assert.strictEqual((await pendingPage).failed, 2, "new readiness invalidates an already prepared mixed cache plan");
+    assert.strictEqual(env.requests.length, beforeSelection + 1, "invalidated plan is never replayed");
+    assert.strictEqual(env.translations().length, 0);
+    env.setAutoRespond(true);
+    await env.restore();
+    // Re-populate A2 Batch after the discarded plan, then verify independent Single metadata.
+    await env.send({ type: "TRANSLATE_SELECTION", selectionText: "Old cached text" });
+    const afterSelection = env.requests.length;
+    env.fillPage([large]);
+    env.setResponseFor(request => ({ ok: true, identity: cacheIdentity("epoch-A2").single, results: request.msg.items.map(item => ({ id: item.id, translation: "A2 single" })) }));
     await env.translate();
-    assert.strictEqual(env.requests.length, afterSingle, "Single identity does not contaminate Batch cache");
+    assert.strictEqual(env.requests.length, afterSelection + 1, "batch epoch change clears Single cache too");
+    await env.restore(); env.fillPage(["Old cached text"]);
+    const beforeBatchHit = env.requests.length;
+    await env.translate();
+    assert.strictEqual(env.requests.length, beforeBatchHit, "Single prompt does not contaminate Batch cache");
+    env.dom.window.close();
+  });
+  await scenario("legacy Runtime and missing identity bypass cache without blocking explicit translation", async () => {
+    const env = makeEnv(pageWithTexts(["Legacy text"]), { dynamic: false });
+    await env.translate(); await env.restore();
+    env.setConnection({ ok: true, paired: true, pairing: "paired", online: true, available: true });
+    const before = env.requests.length;
+    await env.translate(); await env.restore(); await env.translate();
+    assert.strictEqual(env.requests.length, before + 2, "TaskView identity never supplies cache authority");
+    const selected = await env.send({ type: "TRANSLATE_SELECTION", selectionText: "Legacy text" });
+    assert(selected.ok && !selected.cached);
+    assert.strictEqual(env.requests.length, before + 3);
     env.dom.window.close();
   });
   await scenario("cache reuse cannot bypass Runtime offline or credential revoke", async () => {
